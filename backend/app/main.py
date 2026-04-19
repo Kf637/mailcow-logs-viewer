@@ -2,6 +2,7 @@
 Main FastAPI application
 Entry point for the Mailcow Logs Viewer backend
 """
+import base64
 import logging
 root = logging.getLogger()
 root.handlers = []
@@ -31,7 +32,8 @@ from .routers import (
     raw_logs as raw_logs_router,
 )
 from .migrations import run_migrations
-from .auth import BasicAuthMiddleware
+from .auth import BasicAuthMiddleware, verify_credentials
+from .session import get_session_from_request
 from .version import __version__
 
 from .services.geoip_downloader import (
@@ -278,23 +280,45 @@ async def health_check():
 
 
 @app.get("/api/info")
-async def app_info():
+async def app_info(request: Request):
     """Application information endpoint"""
-    return {
+    is_logged_in = not settings.is_authentication_enabled
+
+    if not is_logged_in and settings.is_oauth2_enabled:
+        is_logged_in = get_session_from_request(request) is not None
+
+    if not is_logged_in and settings.is_basic_auth_enabled:
+        authorization = request.headers.get("Authorization", "")
+        if authorization.startswith("Basic "):
+            try:
+                encoded_credentials = authorization.split(" ", 1)[1]
+                decoded_credentials = base64.b64decode(encoded_credentials).decode("utf-8")
+                username, password = decoded_credentials.split(":", 1)
+                is_logged_in = verify_credentials(username, password)
+            except (ValueError, IndexError, UnicodeDecodeError):
+                is_logged_in = False
+
+    info = {
         "name": "mailcow Logs Viewer",
         "version": __version__,
-        "mailcow_url": settings.mailcow_url,
-        "local_domains": settings.local_domains_list,
         "fetch_interval": settings.fetch_interval,
         "retention_days": settings.retention_days,
         "timezone": settings.tz,
         "app_title": settings.app_title,
         "app_logo_url": settings.app_logo_url,
-        "blacklist_count": len(settings.blacklist_emails_list),
         "auth_enabled": settings.is_authentication_enabled,
         "basic_auth_enabled": settings.is_basic_auth_enabled,
         "oauth2_enabled": settings.is_oauth2_enabled,
     }
+
+    if is_logged_in:
+        info.update({
+            "mailcow_url": settings.mailcow_url,
+            "local_domains": settings.local_domains_list,
+            "blacklist_count": len(settings.blacklist_emails_list),
+        })
+
+    return info
 
 
 @app.exception_handler(Exception)
