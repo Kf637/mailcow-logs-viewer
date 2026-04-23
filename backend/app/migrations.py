@@ -994,6 +994,9 @@ def run_migrations():
         # Raw service logs (Live Log Viewer)
         ensure_raw_service_logs_table(db)
         
+        # Spam suppressions table
+        ensure_spam_suppressions_table(db)
+        
         add_geoip_fields_to_dmarc(db)
         add_geoip_fields_to_rspamd(db)
         add_geoip_fields_to_netfilter(db)
@@ -1164,5 +1167,59 @@ def ensure_raw_service_logs_table(db: Session):
             
     except Exception as e:
         logger.error(f"Error ensuring raw_service_logs table: {e}")
+        db.rollback()
+        raise
+
+
+def ensure_spam_suppressions_table(db: Session):
+    """Ensure spam_suppressions table exists for the Spam Suppression feature"""
+    try:
+        result = db.execute(text("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'spam_suppressions'
+            )
+        """))
+        table_exists = result.scalar()
+        
+        if not table_exists:
+            logger.info("Creating spam_suppressions table...")
+            db.execute(text("""
+                CREATE TABLE spam_suppressions (
+                    id SERIAL PRIMARY KEY,
+                    email VARCHAR(255) NOT NULL UNIQUE,
+                    type VARCHAR(20) NOT NULL DEFAULT 'email',
+                    reason VARCHAR(50) NOT NULL,
+                    source VARCHAR(100),
+                    notes TEXT,
+                    bounce_count INTEGER DEFAULT 1,
+                    hard_bounce_count INTEGER DEFAULT 0,
+                    soft_bounce_count INTEGER DEFAULT 0,
+                    last_bounce_dsn VARCHAR(20),
+                    last_bounce_message TEXT,
+                    correlation_key VARCHAR(64),
+                    active BOOLEAN DEFAULT TRUE,
+                    synced_to_rspamd BOOLEAN DEFAULT FALSE,
+                    expires_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            
+            # Create indexes
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_suppression_email ON spam_suppressions(email)"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_suppression_type ON spam_suppressions(type)"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_suppression_reason ON spam_suppressions(reason)"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_suppression_active ON spam_suppressions(active)"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_suppression_active_sync ON spam_suppressions(active, synced_to_rspamd)"))
+            db.execute(text("CREATE INDEX IF NOT EXISTS idx_suppression_expires ON spam_suppressions(active, expires_at)"))
+            
+            db.commit()
+            logger.info("spam_suppressions table created successfully")
+        else:
+            logger.debug("spam_suppressions table already exists")
+            
+    except Exception as e:
+        logger.error(f"Error ensuring spam_suppressions table: {e}")
         db.rollback()
         raise

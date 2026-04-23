@@ -52,7 +52,7 @@ def _get_raw_logs_job_status(job_key: str, field: str, enabled: bool):
 # Keys whose values are masked in GET /api/settings (never returned in plain text)
 _SENSITIVE_SETTING_KEYS = frozenset({
     "mailcow_api_key", "mailcow_api_key_rw", "auth_password", "oauth2_client_secret", "smtp_password",
-    "dmarc_imap_password", "session_secret_key", "maxmind_license_key"
+    "dmarc_imap_password", "session_secret_key", "maxmind_license_key", "rspamd_password"
 })
 MASK_PLACEHOLDER = "********"
 
@@ -357,6 +357,46 @@ async def get_settings_info(db: Session = Depends(get_db)):
                     "status": _get_raw_logs_job_status('cleanup_raw_logs', 'status', settings.raw_logs_enabled),
                     "last_run": _get_raw_logs_job_status('cleanup_raw_logs', 'last_run', settings.raw_logs_enabled),
                     "error": _get_raw_logs_job_status('cleanup_raw_logs', 'error', settings.raw_logs_enabled)
+                },
+                "detect_suppressions": {
+                    "interval": "5 minutes" if settings.suppression_enabled else "Disabled",
+                    "description": "Scans Postfix logs for bounces to auto-suppress recipients",
+                    "enabled": settings.suppression_enabled and settings.suppression_auto_detect,
+                    "status": jobs_status.get('detect_suppressions', {}).get('status', 'idle') if settings.suppression_enabled else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('detect_suppressions', {}).get('last_run')) if settings.suppression_enabled else None,
+                    "error": jobs_status.get('detect_suppressions', {}).get('error') if settings.suppression_enabled else None
+                },
+                "sync_suppressions": {
+                    "interval": "10 minutes" if (settings.suppression_enabled and settings.suppression_rspamd_sync) else "Disabled",
+                    "description": "Syncs active suppressions to Rspamd recipient denylist",
+                    "enabled": settings.suppression_enabled and settings.suppression_rspamd_sync and settings.is_rspamd_configured,
+                    "status": jobs_status.get('sync_suppressions', {}).get('status', 'idle') if (settings.suppression_enabled and settings.suppression_rspamd_sync) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('sync_suppressions', {}).get('last_run')) if (settings.suppression_enabled and settings.suppression_rspamd_sync) else None,
+                    "error": jobs_status.get('sync_suppressions', {}).get('error') if (settings.suppression_enabled and settings.suppression_rspamd_sync) else None
+                },
+                "expire_suppressions": {
+                    "interval": "1 hour" if settings.suppression_enabled else "Disabled",
+                    "description": "Deactivates expired suppression entries",
+                    "enabled": settings.suppression_enabled,
+                    "status": jobs_status.get('expire_suppressions', {}).get('status', 'idle') if settings.suppression_enabled else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('expire_suppressions', {}).get('last_run')) if settings.suppression_enabled else None,
+                    "error": jobs_status.get('expire_suppressions', {}).get('error') if settings.suppression_enabled else None
+                },
+                "process_quarantine_rules": {
+                    "interval": f"{settings.quarantine_rules_interval} minutes" if mailcow_api.has_rw_key else "Disabled (no RW API key)",
+                    "description": "Processes quarantine auto-rules (release/delete matching emails)",
+                    "enabled": mailcow_api.has_rw_key,
+                    "status": jobs_status.get('process_quarantine_rules', {}).get('status', 'idle') if mailcow_api.has_rw_key else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('process_quarantine_rules', {}).get('last_run')) if mailcow_api.has_rw_key else None,
+                    "error": jobs_status.get('process_quarantine_rules', {}).get('error') if mailcow_api.has_rw_key else None
+                },
+                "cleanup_deferred_queue": {
+                    "interval": "5 minutes" if (settings.suppression_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key) else "Disabled",
+                    "description": f"Deletes deferred emails stuck > {settings.queue_cleanup_threshold_minutes}m and suppresses recipients",
+                    "enabled": settings.suppression_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key,
+                    "status": jobs_status.get('cleanup_deferred_queue', {}).get('status', 'idle') if (settings.suppression_enabled and settings.queue_cleanup_enabled) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('cleanup_deferred_queue', {}).get('last_run')) if (settings.suppression_enabled and settings.queue_cleanup_enabled) else None,
+                    "error": jobs_status.get('cleanup_deferred_queue', {}).get('error') if (settings.suppression_enabled and settings.queue_cleanup_enabled) else None
                 }
             },
             "smtp_configuration": {
@@ -381,6 +421,7 @@ async def get_settings_info(db: Session = Depends(get_db)):
             },
             "geoip_configuration": {
                 "enabled": is_license_configured(),
+                "db_valid": get_geoip_status().get('db_valid') if is_license_configured() else None,
                 "databases": get_geoip_status() if is_license_configured() else {
                     "City": {"installed": False, "version": None, "last_updated": None},
                     "ASN": {"installed": False, "version": None, "last_updated": None}
@@ -546,6 +587,7 @@ async def update_settings(body: Dict[str, Any], db: Session = Depends(get_db)):
     mailcow_api.reload_config()
     oauth2_client.reload_config()
     reschedule_interval_jobs()
+    
     return {"settings_edit_via_ui_enabled": True, "settings_migrated": True, "configuration": _effective_config_for_editable(settings)}
 
 
@@ -667,6 +709,89 @@ async def validate_maxmind_license() -> Dict[str, Any]:
         return {"configured": True, "valid": False, "error": "Connection error"}
 
 
+def _run_async_in_background(coro_func):
+    """Helper to run an async function from BackgroundTasks (which expects sync callables)."""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(coro_func())
+    finally:
+        loop.close()
+
+
+@router.get("/settings/geoip/status")
+async def get_geoip_detailed_status():
+    """
+    Get detailed GeoIP status for frontend polling.
+    Returns license validity, DB file info, and DB health validation status.
+    """
+    from ..services.geoip_service import get_geoip_db_valid
+    
+    geoip_status = get_geoip_status() if is_license_configured() else {
+        'configured': False, 'db_valid': None,
+        'City': {'available': False, 'age_days': -1, 'size_mb': 0, 'last_modified': None},
+        'ASN': {'available': False, 'age_days': -1, 'size_mb': 0, 'last_modified': None}
+    }
+    
+    # Get the update_geoip job status
+    jobs_status = get_job_status()
+    geoip_job = jobs_status.get('update_geoip', {})
+    
+    return {
+        "configured": is_license_configured(),
+        "db_valid": get_geoip_db_valid(),
+        "databases": geoip_status,
+        "job_status": geoip_job.get('status', 'idle'),
+        "job_error": geoip_job.get('error'),
+        "job_last_run": format_datetime_utc(geoip_job.get('last_run')) if geoip_job.get('last_run') else None,
+    }
+
+
+@router.post("/settings/geoip/download")
+async def trigger_geoip_download(background_tasks: BackgroundTasks):
+    """
+    Trigger GeoIP database download in background.
+    Called by the setup modal when credentials are valid but DB files are missing.
+    Returns immediately; use GET /settings/geoip/status to poll progress.
+    """
+    if not is_license_configured():
+        raise HTTPException(status_code=400, detail="MaxMind license key not configured")
+    
+    logger.info("Manual GeoIP download triggered from setup modal")
+    from ..scheduler import update_geoip_database
+    background_tasks.add_task(_run_async_in_background, update_geoip_database)
+    return {"status": "started", "message": "GeoIP download started in background"}
+
+
+@router.post("/settings/geoip/validate")
+async def validate_geoip_db():
+    """
+    Validate GeoIP database integrity by running test IP lookups.
+    Called by the setup modal after download completes.
+    """
+    from ..services.geoip_service import validate_geoip_database, reload_geoip_readers, get_geoip_db_valid
+    
+    # Ensure readers are loaded
+    geoip_status = get_geoip_status()
+    if not geoip_status.get('City', {}).get('available'):
+        return {
+            "valid": False,
+            "city_ok": False,
+            "asn_ok": False,
+            "error": "City database file not found"
+        }
+    
+    # Reload readers to pick up any new files
+    reload_geoip_readers()
+    
+    return {
+        "valid": get_geoip_db_valid() is True,
+        "city_ok": get_geoip_db_valid() is True,
+        "asn_ok": get_geoip_db_valid() is True,
+        "db_valid": get_geoip_db_valid(),
+    }
+
+
 # =============================================================================
 # MANUAL JOB TRIGGER
 # =============================================================================
@@ -707,7 +832,12 @@ async def trigger_job(job_name: str, background_tasks: BackgroundTasks):
         update_alias_statistics,
         check_monitored_hosts_job,
         sync_transports_job,
-        send_weekly_summary_email_job
+        send_weekly_summary_email_job,
+        detect_suppressions_job,
+        sync_suppressions_to_rspamd_job,
+        expire_suppressions_job,
+        process_quarantine_rules_job,
+        cleanup_deferred_queue_job
     )
     
     # Map job names to functions and their status keys
@@ -726,7 +856,12 @@ async def trigger_job(job_name: str, background_tasks: BackgroundTasks):
         'alias_stats': ('alias_stats', update_alias_statistics),
         'blacklist_check': ('blacklist_check', check_monitored_hosts_job),
         'sync_transports': ('sync_transports', sync_transports_job),
-        'send_weekly_summary': ('send_weekly_summary', send_weekly_summary_email_job)
+        'send_weekly_summary': ('send_weekly_summary', send_weekly_summary_email_job),
+        'detect_suppressions': ('detect_suppressions', detect_suppressions_job),
+        'sync_suppressions': ('sync_suppressions', sync_suppressions_to_rspamd_job),
+        'expire_suppressions': ('expire_suppressions', expire_suppressions_job),
+        'process_quarantine_rules': ('process_quarantine_rules', process_quarantine_rules_job),
+        'cleanup_deferred_queue': ('cleanup_deferred_queue', cleanup_deferred_queue_job)
     }
     
     if job_name not in job_mapping:

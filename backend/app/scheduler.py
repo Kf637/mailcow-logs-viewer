@@ -21,18 +21,13 @@ from sqlalchemy.exc import IntegrityError
 from .config import settings, set_cached_active_domains
 from .database import get_db_context, SessionLocal
 from .mailcow_api import mailcow_api
-from .models import PostfixLog, RspamdLog, NetfilterLog, MessageCorrelation, DMARCSync, DomainDNSCheck, MailboxStatistics, AliasStatistics, MonitoredHost, BlacklistCheck, DMARCReport, DMARCRecord, TLSReport, TLSReportPolicy
+from .models import PostfixLog, RspamdLog, NetfilterLog, MessageCorrelation, DMARCSync, DomainDNSCheck, MailboxStatistics, AliasStatistics, MonitoredHost, BlacklistCheck, DMARCReport, DMARCRecord, TLSReport, TLSReportPolicy, SpamSuppression
 from .correlation import detect_direction, parse_postfix_message
 from .routers.domains import check_domain_dns, save_dns_check_to_db
 from .services.dmarc_imap_service import sync_dmarc_reports_from_imap
 from .services.dmarc_notifications import send_dmarc_error_notification
 from .services import geoip_service
 
-from .services.geoip_downloader import (
-    update_geoip_database_if_needed,
-    is_license_configured,
-    get_geoip_status
-)
 from .services.geoip_downloader import is_license_configured
 from .services.dmarc_cache import clear_dmarc_cache
 
@@ -131,6 +126,11 @@ job_status = {
     'sync_transports': {'last_run': None, 'status': 'idle', 'error': None},
     'fetch_raw_logs': {'last_run': None, 'status': 'idle', 'error': None},
     'cleanup_raw_logs': {'last_run': None, 'status': 'idle', 'error': None},
+    'detect_suppressions': {'last_run': None, 'status': 'idle', 'error': None},
+    'sync_suppressions': {'last_run': None, 'status': 'idle', 'error': None},
+    'expire_suppressions': {'last_run': None, 'status': 'idle', 'error': None},
+    'process_quarantine_rules': {'last_run': None, 'status': 'idle', 'error': None},
+    'cleanup_deferred_queue': {'last_run': None, 'status': 'idle', 'error': None},
 }
 
 # Number of hosts that were listed on actionable blacklists in the previous blacklist check run (for "cleared" notification)
@@ -1299,13 +1299,26 @@ async def update_geoip_database():
             update_job_status('update_geoip', 'idle', 'License key not configured')
             return
         
-        status = update_geoip_database_if_needed()
+        # Run blocking download in thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        status = await loop.run_in_executor(None, update_geoip_database_if_needed)
         
         if status['City']['updated'] or status['ASN']['updated']:
+            # Reload the GeoIP readers so the cached _geoip_available flag
+            # and reader objects are refreshed with the new database files
+            geoip_service.reload_geoip_readers()
+            logger.info("GeoIP readers reloaded after database update")
             update_job_status('update_geoip', 'success')
         else:
+            # Ensure readers are loaded and validated even when no download was needed
+            # (handles case where DB exists but validation hasn't run yet)
+            if geoip_service.get_geoip_db_valid() is not True:
+                geoip_service.reload_geoip_readers()
             update_job_status('update_geoip', 'success')
         
+    except asyncio.CancelledError:
+        logger.info("GeoIP update cancelled by shutdown")
+        return
     except Exception as e:
         logger.error(f"GeoIP update failed: {e}")
         update_job_status('update_geoip', 'failed', str(e))
@@ -1607,6 +1620,13 @@ async def check_monitored_hosts_job(force: bool = False, send_notification: bool
         finally:
             end_batch_scan()
         
+    except asyncio.CancelledError:
+        logger.info("Blacklist check cancelled by shutdown")
+        try:
+            end_batch_scan()
+        except:
+            pass
+        return
     except Exception as e:
         logger.error(f"Blacklist check failed: {e}")
         update_job_status('blacklist_check', 'failed', str(e))
@@ -1904,12 +1924,18 @@ async def check_all_domains_dns_background():
                 checked_count += 1
                 await asyncio.sleep(0.5)
                 
+            except asyncio.CancelledError:
+                logger.info("DNS check interrupted by shutdown")
+                return
             except Exception as e:
                 logger.error(f"Failed DNS check for {domain_name}: {e}")
         
         logger.info(f"DNS check completed: {checked_count} domains")
         update_job_status('dns_check', 'success')
         
+    except asyncio.CancelledError:
+        logger.info("Background DNS check cancelled by shutdown")
+        return
     except Exception as e:
         logger.error(f"Background DNS check failed: {e}")
         update_job_status('dns_check', 'failed', str(e))
@@ -2488,6 +2514,155 @@ async def send_weekly_summary_email_job():
         logger.error(f"Weekly summary job failed: {e}")
         update_job_status('send_weekly_summary', 'failed', str(e))
 
+async def cleanup_deferred_queue_job():
+    """
+    Periodically scan the mail queue for deferred items stuck longer than
+    QUEUE_CLEANUP_THRESHOLD_MINUTES.  For each stuck item:
+      1. Delete from queue via mailcow API
+      2. Suppress the recipient(s) using suppression_base_expiry_days
+    Completely stateless — only looks at arrival_time vs now.
+    """
+    if not settings.suppression_enabled or not settings.queue_cleanup_enabled:
+        return
+    if not mailcow_api.has_rw_key:
+        return
+
+    update_job_status('cleanup_deferred_queue', 'running')
+
+    try:
+        queue = await mailcow_api.get_queue()
+        if not queue:
+            update_job_status('cleanup_deferred_queue', 'success')
+            return
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+        threshold_seconds = settings.queue_cleanup_threshold_minutes * 60
+        whitelist = settings.suppression_whitelist_domains_list
+
+        items_to_delete = []
+        recipients_to_suppress = []  # (email, dsn_hint)
+
+        for item in queue:
+            queue_name = (item.get('queue_name') or '').lower()
+            if queue_name != 'deferred':
+                continue
+
+            arrival_time = item.get('arrival_time')
+            if not arrival_time:
+                continue
+
+            age_seconds = now_ts - arrival_time
+            if age_seconds < threshold_seconds:
+                continue
+
+            queue_id = item.get('queue_id')
+            if not queue_id:
+                continue
+
+            # This item has been deferred longer than threshold — collect for deletion
+            items_to_delete.append(queue_id)
+
+            # Collect recipients for suppression
+            for rcpt in (item.get('recipients') or []):
+                rcpt_email = rcpt.split(' ')[0].strip('<>').lower()
+                if not rcpt_email or '@' not in rcpt_email:
+                    continue
+                domain = rcpt_email.split('@')[-1]
+                if domain in whitelist:
+                    continue
+                recipients_to_suppress.append(rcpt_email)
+
+            age_min = int(age_seconds / 60)
+            logger.info(
+                f"[QUEUE CLEANUP] Deferred item {queue_id} stuck for {age_min}m "
+                f"(threshold: {settings.queue_cleanup_threshold_minutes}m) — "
+                f"recipients: {', '.join(r.split(' ')[0].strip('<>') for r in (item.get('recipients') or []))}"
+            )
+
+        if not items_to_delete:
+            update_job_status('cleanup_deferred_queue', 'success')
+            return
+
+        # Delete stuck items from queue
+        try:
+            await mailcow_api.delete_queue(items_to_delete)
+            logger.info(f"[QUEUE CLEANUP] Deleted {len(items_to_delete)} stuck deferred item(s) from queue")
+        except Exception as e:
+            logger.error(f"[QUEUE CLEANUP] Failed to delete queue items: {e}")
+            update_job_status('cleanup_deferred_queue', 'failed', f"Queue delete failed: {e}")
+            return
+
+        # Suppress recipients
+        if recipients_to_suppress:
+            unique_recipients = set(recipients_to_suppress)
+            suppress_count = 0
+
+            with get_db_context() as db:
+                for email in unique_recipients:
+                    existing = db.query(SpamSuppression).filter(
+                        SpamSuppression.email == email
+                    ).first()
+
+                    if existing:
+                        existing.bounce_count = (existing.bounce_count or 0) + 1
+                        existing.soft_bounce_count = (existing.soft_bounce_count or 0) + 1
+                        existing.reason = 'deferred_stuck'
+                        existing.last_bounce_message = f'Deferred in queue > {settings.queue_cleanup_threshold_minutes}m — auto-cleaned'
+                        existing.updated_at = datetime.utcnow()
+
+                        if not existing.active or (existing.expires_at and existing.expires_at < datetime.utcnow()):
+                            existing.active = True
+                            existing.synced_to_rspamd = False
+
+                        # Extend expiry
+                        expiry_days = min(
+                            settings.suppression_base_expiry_days * existing.bounce_count,
+                            settings.suppression_max_expiry_days
+                        )
+                        existing.expires_at = datetime.utcnow() + timedelta(days=expiry_days)
+                    else:
+                        new_entry = SpamSuppression(
+                            email=email,
+                            type='email',
+                            reason='deferred_stuck',
+                            source='auto',
+                            bounce_count=1,
+                            hard_bounce_count=0,
+                            soft_bounce_count=1,
+                            last_bounce_dsn='4.x.x',
+                            last_bounce_message=f'Deferred in queue > {settings.queue_cleanup_threshold_minutes}m — auto-cleaned',
+                            active=True,
+                            synced_to_rspamd=False,
+                            expires_at=datetime.utcnow() + timedelta(days=settings.suppression_base_expiry_days),
+                            correlation_key=None
+                        )
+                        db.add(new_entry)
+                    suppress_count += 1
+
+                db.commit()
+
+            logger.info(
+                f"[QUEUE CLEANUP] Suppressed {suppress_count} recipient(s) for "
+                f"{settings.suppression_base_expiry_days} day(s)"
+            )
+
+            # Trigger immediate Rspamd sync so the block takes effect now
+            if settings.suppression_rspamd_sync and settings.is_rspamd_configured:
+                try:
+                    await sync_suppressions_to_rspamd_job()
+                    logger.info("[QUEUE CLEANUP] Triggered immediate Rspamd sync")
+                except Exception as e:
+                    logger.warning(f"[QUEUE CLEANUP] Rspamd sync failed (will retry on schedule): {e}")
+
+        update_job_status('cleanup_deferred_queue', 'success')
+
+    except asyncio.CancelledError:
+        logger.info("[QUEUE CLEANUP] Job cancelled (shutdown)")
+        update_job_status('cleanup_deferred_queue', 'success')
+    except Exception as e:
+        logger.error(f"[QUEUE CLEANUP] Error: {e}", exc_info=True)
+        update_job_status('cleanup_deferred_queue', 'failed', str(e))
+
 
 def start_scheduler():
     """Start the background scheduler"""
@@ -2741,6 +2916,68 @@ def start_scheduler():
             replace_existing=True
         )
 
+        # Job 16: Spam Suppression (if enabled)
+        if settings.suppression_enabled:
+            # Detect bounces from postfix logs every 5 minutes
+            scheduler.add_job(
+                detect_suppressions_job,
+                trigger=IntervalTrigger(minutes=5),
+                id='detect_suppressions',
+                name='Detect Suppressions',
+                replace_existing=True,
+                max_instances=1
+            )
+            
+            # Sync suppressions to Rspamd every 10 minutes
+            if settings.suppression_rspamd_sync and settings.is_rspamd_configured:
+                scheduler.add_job(
+                    sync_suppressions_to_rspamd_job,
+                    trigger=IntervalTrigger(minutes=10),
+                    id='sync_suppressions',
+                    name='Sync Suppressions to Rspamd',
+                    replace_existing=True,
+                    max_instances=1
+                )
+            
+            # Expire old suppressions every hour
+            scheduler.add_job(
+                expire_suppressions_job,
+                trigger=IntervalTrigger(hours=1),
+                id='expire_suppressions',
+                name='Expire Suppressions',
+                replace_existing=True,
+                max_instances=1
+            )
+            
+            logger.info("   [SPAM] Suppression detection: every 5 minutes")
+            if settings.suppression_rspamd_sync and settings.is_rspamd_configured:
+                logger.info("   [SPAM] Rspamd sync: every 10 minutes")
+            logger.info("   [SPAM] Expiry check: every hour")
+            
+            # Deferred queue cleanup (requires RW key)
+            if settings.queue_cleanup_enabled and mailcow_api.has_rw_key:
+                scheduler.add_job(
+                    cleanup_deferred_queue_job,
+                    trigger=IntervalTrigger(minutes=5),
+                    id='cleanup_deferred_queue',
+                    name='Cleanup Deferred Queue',
+                    replace_existing=True,
+                    max_instances=1
+                )
+                logger.info(f"   [SPAM] Deferred queue cleanup: every 5 minutes (threshold: {settings.queue_cleanup_threshold_minutes}m)")
+
+        # Quarantine Auto-Rules
+        if mailcow_api.has_rw_key:
+            scheduler.add_job(
+                process_quarantine_rules_job,
+                trigger=IntervalTrigger(minutes=settings.quarantine_rules_interval),
+                id='process_quarantine_rules',
+                name='Process Quarantine Rules',
+                replace_existing=True,
+                max_instances=1
+            )
+            logger.info(f"   [QUARANTINE] Auto-rules: every {settings.quarantine_rules_interval} minutes")
+
         scheduler.start()
 
         logger.info("[OK] Scheduler started")
@@ -2775,6 +3012,378 @@ def start_scheduler():
     except Exception as e:
         logger.error(f"[ERROR] Failed to start scheduler: {e}")
         raise
+
+
+# =============================================================================
+# SPAM SUPPRESSION SCHEDULER JOBS
+# =============================================================================
+
+async def detect_suppressions_job():
+    """
+    Scan recent postfix logs for bounced/rejected outbound emails
+    and add them to the suppression list.
+    """
+    if not settings.suppression_enabled or not settings.suppression_auto_detect:
+        return
+    
+    update_job_status('detect_suppressions', 'running')
+    
+    try:
+        with get_db_context() as db:
+            # Look for recent bounced outbound emails (last 10 minutes)
+            cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+            
+            # When queue_cleanup_enabled, soft bounces are handled by
+            # cleanup_deferred_queue_job (checks the live queue directly).
+            # Only scan logs for hard bounces in that case.
+            statuses_to_check = ['bounced']
+            if not settings.queue_cleanup_enabled:
+                statuses_to_check.append('deferred')
+            
+            bounce_logs = db.query(PostfixLog).filter(
+                PostfixLog.time >= cutoff,
+                PostfixLog.status.in_(statuses_to_check),
+                PostfixLog.recipient.isnot(None),
+                PostfixLog.dsn.isnot(None),
+                # Only real outbound messages — skip bounce notifications (DSNs)
+                # DSNs have an empty sender or MAILER-DAEMON
+                PostfixLog.sender.isnot(None),
+                PostfixLog.sender != '',
+            ).all()
+            
+            if not bounce_logs:
+                update_job_status('detect_suppressions', 'success')
+                return
+            
+            whitelist = settings.suppression_whitelist_domains_list
+            new_count = 0
+            updated_count = 0
+            emails_for_queue_cleanup = []  # Only hard bounces — deferred/soft should be retried by Postfix
+            
+            for log in bounce_logs:
+                # Skip bounce notification (DSN) entries — their sender is MAILER-DAEMON
+                sender = (log.sender or '').lower().strip()
+                if not sender or sender.startswith('mailer-daemon'):
+                    continue
+                
+                recipient = log.recipient.lower().strip()
+                
+                # Skip whitelisted domains
+                domain = recipient.split('@')[-1] if '@' in recipient else ''
+                if domain in whitelist:
+                    continue
+                
+                dsn = log.dsn or ''
+                is_hard = dsn.startswith('5.')
+                is_soft = dsn.startswith('4.')
+                
+                if is_hard and settings.suppression_hard_bounce_action == 'ignore':
+                    continue
+                if is_soft and settings.suppression_soft_bounce_action == 'ignore':
+                    continue
+                
+                # Only clean queue for hard bounces (permanent failures)
+                # Deferred/soft bounces are temporary — Postfix should keep retrying
+                if is_hard:
+                    emails_for_queue_cleanup.append(recipient)
+                
+                # Check if already exists
+                existing = db.query(SpamSuppression).filter(
+                    SpamSuppression.email == recipient
+                ).first()
+                
+                if existing:
+                    # Update bounce counts
+                    existing.bounce_count = (existing.bounce_count or 0) + 1
+                    if is_hard:
+                        existing.hard_bounce_count = (existing.hard_bounce_count or 0) + 1
+                        existing.reason = 'hard_bounce'
+                    elif is_soft:
+                        existing.soft_bounce_count = (existing.soft_bounce_count or 0) + 1
+                    
+                    existing.last_bounce_dsn = dsn
+                    existing.last_bounce_message = log.message[:500] if log.message else None
+                    existing.updated_at = datetime.utcnow()
+                    
+                    # Re-activate if expired
+                    if not existing.active or (existing.expires_at and existing.expires_at < datetime.utcnow()):
+                        existing.active = True
+                        existing.synced_to_rspamd = False
+                    
+                    # Progressive expiry: base_days × bounce_count, capped at max_days
+                    expiry_days = min(
+                        settings.suppression_base_expiry_days * existing.bounce_count,
+                        settings.suppression_max_expiry_days
+                    )
+                    existing.expires_at = datetime.utcnow() + timedelta(days=expiry_days)
+                    
+                    updated_count += 1
+                else:
+                    # Determine if we should suppress
+                    if is_soft and settings.suppression_soft_bounce_action == 'count':
+                        # For soft bounces with count action, we still create the entry
+                        # but only activate it when threshold is reached
+                        pass
+                    
+                    reason = 'hard_bounce' if is_hard else ('soft_bounce' if is_soft else 'rejected')
+                    
+                    is_active = True
+                    # For soft bounces with count action, only activate if threshold reached
+                    if is_soft and settings.suppression_soft_bounce_action == 'count':
+                        is_active = False
+                    
+                    new_entry = SpamSuppression(
+                        email=recipient,
+                        type='email',
+                        reason=reason,
+                        source='auto',
+                        bounce_count=1,
+                        hard_bounce_count=1 if is_hard else 0,
+                        soft_bounce_count=1 if is_soft else 0,
+                        last_bounce_dsn=dsn,
+                        last_bounce_message=log.message[:500] if log.message else None,
+                        active=is_active,
+                        synced_to_rspamd=False,
+                        expires_at=datetime.utcnow() + timedelta(days=settings.suppression_base_expiry_days),
+                        correlation_key=None
+                    )
+                    
+                    db.add(new_entry)
+                    new_count += 1
+            
+            db.commit()
+            
+            if new_count > 0 or updated_count > 0:
+                logger.info(f"[SUPPRESSION] Detected {new_count} new, {updated_count} updated suppressions")
+                
+                # Trigger immediate Rspamd sync so the block takes effect now
+                if settings.suppression_rspamd_sync and settings.is_rspamd_configured:
+                    try:
+                        await sync_suppressions_to_rspamd_job()
+                        logger.info("[SUPPRESSION] Triggered immediate Rspamd sync")
+                    except Exception as e:
+                        logger.warning(f"[SUPPRESSION] Rspamd sync failed (will retry on schedule): {e}")
+            
+            # Clean up queue items for ALL detected bounce recipients
+            # If a message is bouncing/deferred, there's no point keeping it stuck in the queue
+            if emails_for_queue_cleanup and mailcow_api.has_rw_key:
+                try:
+                    queue = await mailcow_api.get_queue()
+                    if queue:
+                        cleanup_set = set(emails_for_queue_cleanup)
+                        items_to_delete = []
+                        for item in queue:
+                            recipients = item.get('recipients', [])
+                            queue_id = item.get('queue_id')
+                            if not queue_id or not recipients:
+                                continue
+                            for rcpt in recipients:
+                                rcpt_email = rcpt.split(' ')[0].strip('<>').lower()
+                                if rcpt_email in cleanup_set:
+                                    items_to_delete.append(queue_id)
+                                    break
+                        
+                        if items_to_delete:
+                            await mailcow_api.delete_queue(items_to_delete)
+                            logger.info(
+                                f"[SUPPRESSION] Cleaned up {len(items_to_delete)} queue item(s) "
+                                f"for {len(cleanup_set)} bounced address(es)"
+                            )
+                except Exception as e:
+                    logger.warning(f"[SUPPRESSION] Queue cleanup failed: {e}")
+            
+            update_job_status('detect_suppressions', 'success')
+            
+    except Exception as e:
+        logger.error(f"[SUPPRESSION] Detection error: {e}", exc_info=True)
+        update_job_status('detect_suppressions', 'failed', str(e))
+
+
+async def sync_suppressions_to_rspamd_job():
+    """
+    Sync active suppressions to Rspamd's global_rcpt_blacklist.map
+    using the shared sync function from the suppressions router.
+    """
+    if not settings.suppression_enabled or not settings.suppression_rspamd_sync:
+        return
+    if not settings.is_rspamd_configured or not settings.mailcow_api_key_rw:
+        return
+    
+    update_job_status('sync_suppressions', 'running')
+    
+    try:
+        with get_db_context() as db:
+            from app.routers.suppressions import sync_suppressions_to_rspamd
+            result = await sync_suppressions_to_rspamd(db)
+            
+            logger.info(f"[SUPPRESSION] Rspamd sync complete: {result.get('synced', 0)} active entries")
+            update_job_status('sync_suppressions', 'success')
+    except Exception as e:
+        logger.error(f"[SUPPRESSION] Sync error: {e}", exc_info=True)
+        update_job_status('sync_suppressions', 'failed', str(e))
+
+
+async def expire_suppressions_job():
+    """
+    Deactivate suppressions that have passed their expiry date.
+    """
+    if not settings.suppression_enabled:
+        return
+    
+    update_job_status('expire_suppressions', 'running')
+    
+    try:
+        with get_db_context() as db:
+            now = datetime.utcnow()
+            
+            expired = db.query(SpamSuppression).filter(
+                SpamSuppression.active == True,
+                SpamSuppression.expires_at.isnot(None),
+                SpamSuppression.expires_at <= now
+            ).all()
+            
+            if expired:
+                for entry in expired:
+                    entry.active = False
+                    entry.synced_to_rspamd = False  # Will be removed from Rspamd on next sync
+                
+                db.commit()
+                logger.info(f"[SUPPRESSION] Expired {len(expired)} suppressions")
+            
+            update_job_status('expire_suppressions', 'success')
+            
+    except Exception as e:
+        logger.error(f"[SUPPRESSION] Expiry error: {e}", exc_info=True)
+        update_job_status('expire_suppressions', 'failed', str(e))
+
+
+async def process_quarantine_rules_job():
+    """
+    Process quarantine auto-rules:
+    1. Fetch quarantine items from mailcow
+    2. Match against enabled rules (delete rules first)
+    3. Execute actions (release/delete) up to max_actions limit
+    4. Log each action to QuarantineRuleLog
+    5. Clean up old logs based on retention setting
+    """
+    from .models import QuarantineRule, QuarantineRuleLog
+    from .routers.quarantine_rules import _find_matching_rule
+    import re
+    
+    if not mailcow_api.has_rw_key:
+        return
+    
+    update_job_status('process_quarantine_rules', 'running')
+    
+    try:
+        # Fetch quarantine
+        quarantine = await mailcow_api.get_quarantine()
+        if not quarantine:
+            update_job_status('process_quarantine_rules', 'success')
+            return
+        
+        # Load enabled rules
+        with get_db_context() as db:
+            rules = db.query(QuarantineRule).filter(
+                QuarantineRule.enabled == True
+            ).all()
+            
+            if not rules:
+                update_job_status('process_quarantine_rules', 'success')
+                return
+            
+            # Match items against rules
+            actions_to_take = []  # [(item, rule)]
+            max_actions = settings.quarantine_rules_max_actions
+            
+            for item in quarantine:
+                if len(actions_to_take) >= max_actions:
+                    break
+                
+                sender = (item.get('sender') or '').lower()
+                rcpt = (item.get('rcpt') or '').lower()
+                subject = item.get('subject') or ''
+                sender_domain = sender.split('@')[-1] if '@' in sender else ''
+                
+                matched_rule = _find_matching_rule(rules, sender, sender_domain, rcpt, subject)
+                if matched_rule:
+                    actions_to_take.append((item, matched_rule))
+            
+            if not actions_to_take:
+                update_job_status('process_quarantine_rules', 'success')
+                return
+            
+            # Group by action
+            release_items = [(item, rule) for item, rule in actions_to_take if rule.action == 'release']
+            delete_items = [(item, rule) for item, rule in actions_to_take if rule.action == 'delete']
+            
+            released_count = 0
+            deleted_count = 0
+            
+            # Execute releases
+            if release_items:
+                release_ids = [str(item.get('id', '')) for item, _ in release_items]
+                try:
+                    await mailcow_api.release_quarantine(release_ids)
+                    released_count = len(release_ids)
+                except Exception as e:
+                    logger.error(f"[QUARANTINE RULES] Release failed: {e}")
+            
+            # Execute deletes
+            if delete_items:
+                delete_ids = [str(item.get('id', '')) for item, _ in delete_items]
+                try:
+                    await mailcow_api.delete_quarantine(delete_ids)
+                    deleted_count = len(delete_ids)
+                except Exception as e:
+                    logger.error(f"[QUARANTINE RULES] Delete failed: {e}")
+            
+            # Log actions and update hit counts
+            rule_hit_counts = {}  # rule_id -> count
+            for item, rule in actions_to_take:
+                log_entry = QuarantineRuleLog(
+                    rule_id=rule.id,
+                    rule_name=rule.name,
+                    action=rule.action,
+                    quarantine_id=str(item.get('id', '')),
+                    sender=item.get('sender'),
+                    recipient=item.get('rcpt'),
+                    subject=(item.get('subject') or '')[:500],
+                    matched_field=rule.match_type,
+                    matched_value=rule.match_value,
+                )
+                db.add(log_entry)
+                rule_hit_counts[rule.id] = rule_hit_counts.get(rule.id, 0) + 1
+            
+            # Update hit counts
+            now = datetime.utcnow()
+            for rule_id, count in rule_hit_counts.items():
+                rule = db.query(QuarantineRule).filter(QuarantineRule.id == rule_id).first()
+                if rule:
+                    rule.hit_count = (rule.hit_count or 0) + count
+                    rule.last_hit_at = now
+            
+            # Clean up old logs
+            retention_days = settings.quarantine_rules_log_retention_days
+            if retention_days > 0:
+                cutoff = datetime.utcnow() - timedelta(days=retention_days)
+                db.query(QuarantineRuleLog).filter(
+                    QuarantineRuleLog.created_at < cutoff
+                ).delete(synchronize_session=False)
+            
+            db.commit()
+            
+            if released_count > 0 or deleted_count > 0:
+                logger.info(
+                    f"[QUARANTINE RULES] Processed: {released_count} released, {deleted_count} deleted "
+                    f"(from {len(quarantine)} quarantine items, {len(rules)} rules)"
+                )
+        
+        update_job_status('process_quarantine_rules', 'success')
+        
+    except Exception as e:
+        logger.error(f"[QUARANTINE RULES] Processing error: {e}", exc_info=True)
+        update_job_status('process_quarantine_rules', 'failed', str(e))
 
 
 def stop_scheduler():

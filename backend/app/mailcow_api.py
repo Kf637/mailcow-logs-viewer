@@ -55,6 +55,11 @@ class MailcowAPI:
         if old_url != self.base_url:
             logger.info(f"mailcow API client configuration reloaded: {old_url} -> {self.base_url}")
     
+    @property
+    def has_rw_key(self) -> bool:
+        """Check if a Read-Write API key is configured."""
+        return self.headers_rw is not None
+    
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10)
@@ -853,6 +858,131 @@ class MailcowAPI:
         )
         logger.info(f"Quarantine delete response: {data}")
         return data
+
+    # ====================================================================
+    # Rspamd Map API Methods
+    # ====================================================================
+
+    async def _make_rspamd_request(self, endpoint: str, method: str = "GET", extra_headers: dict = None, **kwargs) -> Any:
+        """
+        Make HTTP request to Rspamd API (via mailcow proxy at /rspamd/).
+        Uses Password header for authentication instead of X-API-Key.
+        
+        Args:
+            endpoint: Rspamd API endpoint (e.g., '/rspamd/maps')
+            method: HTTP method
+            extra_headers: Additional headers (e.g., map ID)
+            **kwargs: Additional arguments for httpx
+            
+        Returns:
+            Response from Rspamd API (varies by endpoint)
+            
+        Raises:
+            MailcowAPIError: If request fails or rspamd password not configured
+        """
+        rspamd_pw = settings.rspamd_password
+        if not rspamd_pw:
+            raise MailcowAPIError(
+                "Rspamd password (RSPAMD_PASSWORD) is not configured. "
+                "Set the Rspamd UI password in Settings to use Rspamd map features."
+            )
+        
+        url = f"{self.base_url}{endpoint}"
+        headers = {"Password": rspamd_pw}
+        if extra_headers:
+            headers.update(extra_headers)
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=self.verify_ssl) as client:
+            try:
+                response = await client.request(method, url, headers=headers, **kwargs)
+                
+                if response.status_code == 401 or response.status_code == 403:
+                    raise MailcowAPIError("Rspamd password authentication failed. Check RSPAMD_PASSWORD setting.")
+                
+                response.raise_for_status()
+                return response
+                
+            except httpx.HTTPStatusError as e:
+                raise MailcowAPIError(f"Rspamd API request failed with status {e.response.status_code}")
+            except httpx.RequestError as e:
+                raise MailcowAPIError(f"Rspamd API request failed: {str(e)}")
+
+    async def get_rspamd_maps(self) -> List[Dict[str, Any]]:
+        """
+        List all Rspamd map files.
+        
+        GET /rspamd/maps
+        Header: Password
+        
+        Returns:
+            List of map metadata dicts with keys: map (id), description, uri, type, editable, loaded, cached
+        """
+        response = await self._make_rspamd_request("/rspamd/maps")
+        data = response.json()
+        if not isinstance(data, list):
+            logger.warning(f"Unexpected Rspamd maps response format: {type(data)}")
+            return []
+        return data
+
+    async def get_rspamd_map_content(self, map_id: int) -> str:
+        """
+        Read the content of a specific Rspamd map file.
+        
+        GET /rspamd/getmap
+        Headers: Password, map (map ID)
+        
+        Args:
+            map_id: The numeric map identifier from get_rspamd_maps()
+            
+        Returns:
+            Raw map content as text
+        """
+        response = await self._make_rspamd_request(
+            "/rspamd/getmap",
+            extra_headers={"map": str(map_id)}
+        )
+        return response.text
+
+    async def find_rspamd_map_id(self, map_filename: str) -> Optional[int]:
+        """
+        Find the numeric map ID for a given map filename.
+        
+        Args:
+            map_filename: Filename to search for (e.g., 'global_rcpt_blacklist.map')
+            
+        Returns:
+            Map ID if found, None otherwise
+        """
+        maps = await self.get_rspamd_maps()
+        for m in maps:
+            uri = m.get("uri", "")
+            if map_filename in uri:
+                return m.get("map")
+        return None
+
+    async def edit_rspamd_map(self, map_filename: str, map_data: str) -> Any:
+        """
+        Update the content of an Rspamd map file via mailcow API.
+        
+        POST /api/v1/edit/rspamd-map
+        Uses Read-Write API key (X-API-Key header).
+        
+        Args:
+            map_filename: The map file name (e.g., 'global_rcpt_blacklist.map')
+            map_data: The full map content to write
+            
+        Returns:
+            Response from mailcow API
+        """
+        payload = {
+            "items": [map_filename],
+            "attr": {"rspamd_map_data": map_data}
+        }
+        return await self._make_rw_request(
+            "/api/v1/edit/rspamd-map",
+            method="POST",
+            json=payload
+        )
 
     @property
     def has_rw_key(self) -> bool:

@@ -14,10 +14,14 @@ GEOIP_ASN_DB_PATH = "/app/data/GeoLite2-ASN.mmdb"
 _city_reader = None
 _asn_reader = None
 _geoip_available = None
+_geoip_db_valid = None  # None = not checked, True = validated, False = corrupt
+
+# Well-known IPs for validation (Google DNS — always returns valid GeoIP data)
+_VALIDATION_IPS = ['8.8.8.8', '1.1.1.1']
 
 
 def is_geoip_available() -> bool:
-    """Check if GeoIP databases are available"""
+    """Check if GeoIP databases are available AND validated."""
     global _geoip_available
     
     if _geoip_available is None:
@@ -33,6 +37,10 @@ def is_geoip_available() -> bool:
         if not asn_exists:
             logger.warning(f"GeoIP ASN database not found at {GEOIP_ASN_DB_PATH}")
             logger.info("ASN information will not be available")
+    
+    # If files exist but DB was flagged as corrupt, disable
+    if _geoip_available and _geoip_db_valid is False:
+        return False
     
     return _geoip_available
 
@@ -189,12 +197,82 @@ def enrich_dmarc_record(record_data: Dict) -> Dict:
     return record_data
 
 
+def validate_geoip_database() -> dict:
+    """
+    Validate GeoIP databases by performing test IP lookups.
+    This detects corrupt or truncated .mmdb files that would cause
+    silent failures or hangs in the maxminddb C extension.
+    
+    Returns:
+        {
+            'city_ok': bool,
+            'asn_ok': bool,
+            'valid': bool,       # True if city_ok (minimum requirement)
+            'error': str | None
+        }
+    """
+    global _geoip_db_valid
+    
+    result = {'city_ok': False, 'asn_ok': False, 'valid': False, 'error': None}
+    
+    # Test City DB
+    city_reader = get_city_reader()
+    if city_reader:
+        try:
+            import geoip2.errors
+            for test_ip in _VALIDATION_IPS:
+                try:
+                    response = city_reader.city(test_ip)
+                    if response and response.country.iso_code:
+                        result['city_ok'] = True
+                        break
+                except geoip2.errors.AddressNotFoundError:
+                    continue
+        except Exception as e:
+            result['error'] = f"City DB validation failed: {e}"
+            logger.error(f"GeoIP City DB validation error: {e}")
+    else:
+        result['error'] = "City DB could not be loaded"
+    
+    # Test ASN DB
+    asn_reader = get_asn_reader()
+    if asn_reader:
+        try:
+            import geoip2.errors
+            for test_ip in _VALIDATION_IPS:
+                try:
+                    response = asn_reader.asn(test_ip)
+                    if response and response.autonomous_system_number:
+                        result['asn_ok'] = True
+                        break
+                except geoip2.errors.AddressNotFoundError:
+                    continue
+        except Exception as e:
+            logger.error(f"GeoIP ASN DB validation error: {e}")
+    
+    result['valid'] = result['city_ok']
+    _geoip_db_valid = result['valid']
+    
+    if result['valid']:
+        logger.info(f"✓ GeoIP database validation passed (City: {result['city_ok']}, ASN: {result['asn_ok']})")
+    else:
+        logger.warning(f"✗ GeoIP database validation failed: {result.get('error', 'Unknown error')}")
+    
+    return result
+
+
+def get_geoip_db_valid() -> Optional[bool]:
+    """Get the current DB validation status. None = not checked yet."""
+    return _geoip_db_valid
+
+
 def reload_geoip_readers():
     """
-    Reload GeoIP readers (after database update)
-    Call this after downloading new databases
+    Reload GeoIP readers (after database update).
+    Validates the databases after reloading.
+    Call this after downloading new databases.
     """
-    global _city_reader, _asn_reader, _geoip_available
+    global _city_reader, _asn_reader, _geoip_available, _geoip_db_valid
     
     if _city_reader:
         try:
@@ -211,16 +289,24 @@ def reload_geoip_readers():
         _asn_reader = None
     
     _geoip_available = None
+    _geoip_db_valid = None
     
     city_ok = get_city_reader() is not None
     asn_ok = get_asn_reader() is not None
     
-    if city_ok and asn_ok:
-        logger.info("✓ GeoIP databases reloaded successfully (City + ASN)")
-        return True
-    elif city_ok:
-        logger.info("✓ GeoIP City database reloaded (ASN unavailable)")
-        return True
+    if city_ok:
+        # Validate the loaded databases
+        validation = validate_geoip_database()
+        if validation['valid']:
+            if asn_ok:
+                logger.info("✓ GeoIP databases reloaded and validated (City + ASN)")
+            else:
+                logger.info("✓ GeoIP City database reloaded and validated (ASN unavailable)")
+            return True
+        else:
+            logger.warning(f"GeoIP databases reloaded but validation failed: {validation.get('error')}")
+            return False
     else:
         logger.warning("Failed to reload GeoIP databases")
+        _geoip_db_valid = False
         return False

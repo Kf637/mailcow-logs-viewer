@@ -30,6 +30,7 @@ When authentication is enabled, all API endpoints (except public endpoints liste
 10. [Statistics](#statistics)
 11. [Status](#status)
 12. [Settings](#settings)
+    - [GeoIP Management](#geoip-management)
     - [SMTP & IMAP Test](#smtp--imap-test)
 13. [Export](#export)
 14. [DMARC](#dmarc)
@@ -37,6 +38,10 @@ When authentication is enabled, all API endpoints (except public endpoints liste
 15. [Blacklist Monitoring](#blacklist-monitoring)
 16. [Reporting](#reporting)
 17. [Raw Logs (Live Log Viewer)](#raw-logs-live-log-viewer)
+18. [Spam Filter](#spam-filter)
+    - [Rspamd Maps](#rspamd-maps)
+    - [Suppressions](#suppressions)
+19. [Quarantine Auto-Rules](#quarantine-auto-rules)
 
 ---
 
@@ -374,7 +379,8 @@ job_status = {
     'cleanup_logs': {'last_run': datetime, 'status': str, 'error': str|None},
     'check_app_version': {'last_run': datetime, 'status': str, 'error': str|None},
     'dns_check': {'last_run': datetime, 'status': str, 'error': str|None},
-    'update_geoip': {'last_run': datetime, 'status': str, 'error': str|None}
+    'update_geoip': {'last_run': datetime, 'status': str, 'error': str|None},
+    'cleanup_deferred_queue': {'last_run': datetime, 'status': str, 'error': str|None}
 }
 ```
 
@@ -407,6 +413,11 @@ Job status is accessible through:
 | **Check App Version** | 6 hours | Checks GitHub for application updates |
 | **DNS Check** | 6 hours | Validates DNS records (SPF, DKIM, DMARC) for all active domains |
 | **Update GeoIP** | Weekly (Sunday 3 AM) | Updates MaxMind GeoIP databases for DMARC source IP enrichment |
+| **Detect Suppressions** | 5 minutes | Scans Postfix logs for hard bounces to auto-suppress recipients |
+| **Cleanup Deferred Queue** | 5 minutes | Deletes deferred emails stuck longer than threshold and suppresses recipients |
+| **Sync Suppressions** | 10 minutes | Syncs active suppressions to Rspamd recipient denylist |
+| **Expire Suppressions** | 1 hour | Deactivates expired suppression entries |
+| **Process Quarantine Rules** | 5 minutes | Processes quarantine auto-rules (release/delete matching emails) |
 
 ### Implementation Details
 
@@ -2659,6 +2670,11 @@ Manually trigger a background job.
 - `blacklist_check`: Check blacklists
 - `sync_transports`: Sync transports
 - `send_weekly_summary`: Send weekly summary email
+- `detect_suppressions`: Detect bounces and suppress recipients
+- `sync_suppressions`: Sync suppressions to Rspamd
+- `expire_suppressions`: Expire old suppressions
+- `process_quarantine_rules`: Process quarantine auto-rules
+- `cleanup_deferred_queue`: Clean up stuck deferred queue items
 
 **Response:**
 ```json
@@ -2672,6 +2688,119 @@ Manually trigger a background job.
 **Error Responses:**
 - `404`: Unknown job name
 - `409`: Job is already running
+
+---
+
+## GeoIP Management
+
+### GET /api/settings/geoip/status
+
+Get detailed GeoIP status for frontend polling during setup/download.
+
+**Authentication:** Required
+
+**Response:**
+```json
+{
+  "configured": true,
+  "db_valid": true,
+  "databases": {
+    "configured": true,
+    "db_valid": true,
+    "City": {
+      "available": true,
+      "age_days": 1,
+      "size_mb": 62.3,
+      "last_modified": "2026-04-22T10:00:00"
+    },
+    "ASN": {
+      "available": true,
+      "age_days": 0,
+      "size_mb": 11.3,
+      "last_modified": "2026-04-22T18:00:00"
+    }
+  },
+  "job_status": "success",
+  "job_error": null,
+  "job_last_run": "2026-04-22T18:00:05Z"
+}
+```
+
+**Response Fields:**
+- `configured`: Boolean — whether MaxMind Account ID and License Key are set
+- `db_valid`: Boolean or null — `true` if DB validated, `false` if corrupt, `null` if not yet checked
+- `databases`: Object — file-level info for City and ASN databases (size, age, availability)
+- `job_status`: String — last GeoIP update job status: `idle`, `running`, `success`, `failed`
+- `job_error`: String or null — error message if last job failed
+- `job_last_run`: String or null — ISO timestamp of last job execution
+
+**Notes:**
+- Used by the GeoIP Setup Modal to poll download progress
+- Returns `configured: false` when credentials are not set
+
+---
+
+### POST /api/settings/geoip/download
+
+Trigger GeoIP database download in background.
+
+**Authentication:** Required
+
+**Response:**
+```json
+{
+  "status": "started",
+  "message": "GeoIP download started in background"
+}
+```
+
+**Error Responses:**
+- `400`: MaxMind license key not configured
+
+**Notes:**
+- Returns immediately; download runs in background
+- Use `GET /api/settings/geoip/status` to poll progress (`job_status` field)
+- Download includes both GeoLite2-City and GeoLite2-ASN databases
+- After download completes, readers are reloaded and validated automatically
+
+---
+
+### POST /api/settings/geoip/validate
+
+Validate GeoIP database integrity by running test IP lookups.
+
+**Authentication:** Required
+
+**Response:**
+```json
+{
+  "valid": true,
+  "city_ok": true,
+  "asn_ok": true,
+  "db_valid": true
+}
+```
+
+**Response Fields:**
+- `valid`: Boolean — overall validation result
+- `city_ok`: Boolean — City database passed lookup test
+- `asn_ok`: Boolean — ASN database passed lookup test
+- `db_valid`: Boolean or null — current `_geoip_db_valid` state after reload
+
+**Error Response (DB not found):**
+```json
+{
+  "valid": false,
+  "city_ok": false,
+  "asn_ok": false,
+  "error": "City database file not found"
+}
+```
+
+**Notes:**
+- Reloads readers before validation to pick up newly downloaded files
+- Tests lookups against well-known IPs (8.8.8.8, 1.1.1.1)
+- Called by the GeoIP Setup Modal as Step 3 (integrity check)
 
 ---
 
@@ -4256,3 +4385,571 @@ Authentication error (connection will be closed with code 4401):
 - Only entries for the currently selected service are streamed
 - Use `subscribe` action to change services without reconnecting
 - Tokens are single-use and expire after 30 seconds
+
+---
+
+## Spam Filter
+
+The Spam Filter feature provides two capabilities:
+1. **Rspamd Maps** — Direct editor for Rspamd map files
+2. **Suppressions** — Email suppression list with automatic bounce detection
+
+### Rspamd Maps
+
+#### GET /api/rspamd/config
+
+Check if Rspamd is configured (password set).
+
+**Response:**
+```json
+{
+  "configured": true,
+  "rw_configured": true
+}
+```
+
+**Response Fields:**
+- `configured`: Boolean - `true` if `RSPAMD_PASSWORD` is set
+- `rw_configured`: Boolean - `true` if `MAILCOW_API_KEY_RW` is set (required for writing)
+
+---
+
+#### GET /api/rspamd/maps
+
+List all available Rspamd map files with metadata.
+
+**Response:**
+```json
+[
+  {
+    "filename": "global_smtp_from_whitelist.map",
+    "display_name": "Envelope Sender Allowlist",
+    "category": "sender",
+    "description": "Allowlisted envelope senders",
+    "regex": false,
+    "entry_count": 5
+  }
+]
+```
+
+---
+
+#### GET /api/rspamd/maps/{filename}
+
+Read the content of a specific Rspamd map file.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filename` | string | Map filename (e.g., `global_smtp_from_whitelist.map`) |
+
+**Response:**
+```json
+{
+  "filename": "global_smtp_from_whitelist.map",
+  "content": "user@example.com\nadmin@example.com",
+  "entry_count": 2
+}
+```
+
+---
+
+#### PUT /api/rspamd/maps/{filename}
+
+Update a Rspamd map file. Requires Read-Write API key.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `filename` | string | Map filename to update |
+
+**Request Body:**
+```json
+{
+  "content": "user@example.com\nadmin@example.com"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Map updated successfully"
+}
+```
+
+---
+
+#### POST /api/rspamd/validate
+
+Validate regex patterns before saving.
+
+**Request Body:**
+```json
+{
+  "patterns": ["/.*@example\\.com/i", "/invalid[/"]
+}
+```
+
+**Response:**
+```json
+{
+  "valid": false,
+  "errors": [
+    {
+      "line": 2,
+      "pattern": "/invalid[/",
+      "error": "unterminated character set"
+    }
+  ]
+}
+```
+
+---
+
+### Suppressions
+
+#### GET /api/suppressions
+
+List suppression entries with pagination, search, and filters.
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `page` | integer | `1` | Page number |
+| `per_page` | integer | `50` | Items per page (max 200) |
+| `search` | string | `""` | Search by email address |
+| `reason` | string | `""` | Filter by reason: `hard_bounce`, `soft_bounce`, `rejected`, `manual` |
+| `active` | string | `""` | Filter by active status: `true` or `false` |
+| `sort` | string | `created_at` | Sort field: `email`, `reason`, `bounce_count`, `created_at`, `expires_at` |
+| `order` | string | `desc` | Sort order: `asc` or `desc` |
+
+**Response:**
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "email": "bounce@example.com",
+      "type": "email",
+      "reason": "hard_bounce",
+      "source": "auto",
+      "notes": null,
+      "bounce_count": 3,
+      "hard_bounce_count": 2,
+      "soft_bounce_count": 1,
+      "last_bounce_dsn": "5.1.1",
+      "last_bounce_message": "User unknown",
+      "active": true,
+      "synced_to_rspamd": true,
+      "expires_at": "2026-05-01T00:00:00Z",
+      "is_expired": false,
+      "expires_in": {
+        "days": 11,
+        "hours": 5,
+        "total_seconds": 968400,
+        "human": "11 days"
+      },
+      "created_at": "2026-04-20T10:00:00Z",
+      "updated_at": "2026-04-20T10:00:00Z"
+    }
+  ],
+  "total": 1,
+  "page": 1,
+  "per_page": 50,
+  "total_pages": 1
+}
+```
+
+**Notes:**
+- `expires_at`: `null` means permanent block (never expires)
+- `expires_in`: Only present when `expires_at` is set and not expired
+- `is_expired`: `true` when `expires_at` is in the past
+
+---
+
+#### GET /api/suppressions/stats
+
+Get suppression statistics summary.
+
+**Response:**
+```json
+{
+  "total": 150,
+  "active": 120,
+  "inactive": 30,
+  "synced": 115,
+  "pending_sync": 5,
+  "expired": 10,
+  "by_reason": {
+    "hard_bounce": 80,
+    "soft_bounce": 40,
+    "rejected": 15,
+    "manual": 15
+  },
+  "by_source": {
+    "auto": 135,
+    "manual": 10,
+    "import": 5
+  }
+}
+```
+
+---
+
+#### GET /api/suppressions/config
+
+Get suppression feature configuration.
+
+**Response:**
+```json
+{
+  "enabled": true,
+  "auto_detect": true,
+  "rspamd_sync": true,
+  "rspamd_configured": true,
+  "hard_bounce_action": "suppress",
+  "soft_bounce_action": "suppress",
+  "soft_bounce_threshold": 3,
+  "base_expiry_days": 7,
+  "max_expiry_days": 90,
+  "whitelist_domains": ["example.com"]
+}
+```
+
+---
+
+#### POST /api/suppressions
+
+Create a new suppression entry.
+
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "type": "email",
+  "reason": "manual",
+  "notes": "Repeated bounces",
+  "permanent": true,
+  "expires_at": null
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `email` | string | Yes | — | Email address, domain, or regex pattern |
+| `type` | string | No | `email` | `email` or `domain` |
+| `reason` | string | No | `manual` | `manual`, `hard_bounce`, `soft_bounce`, `rejected` |
+| `notes` | string | No | `null` | Free text notes |
+| `permanent` | boolean | No | `true` | `true` = never expires, `false` = uses `expires_at` |
+| `expires_at` | string | No | `null` | ISO 8601 datetime (used when `permanent=false`) |
+
+**Response:** `200 OK` — Returns the created suppression object (same format as list item)
+
+**Error Responses:**
+- `409 Conflict`: Email already exists in suppression list
+- `422 Unprocessable Entity`: Validation error (invalid email/type/reason)
+
+**Notes:**
+- Domain type entries are stored as regex patterns (e.g., `/.+@example\.com/i`)
+- Regex patterns (starting with `/`) bypass email format validation
+- If `permanent=false` and no `expires_at` is provided, default expiry is `base_expiry_days` from config
+
+---
+
+#### PUT /api/suppressions/{suppression_id}
+
+Update an existing suppression entry.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `suppression_id` | integer | Suppression entry ID |
+
+**Request Body:**
+```json
+{
+  "active": true,
+  "notes": "Updated notes",
+  "expires_at": "null"
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `active` | boolean | Toggle active/inactive (triggers re-sync) |
+| `notes` | string | Update notes |
+| `expires_at` | string | ISO datetime to set expiry, or `"null"` / `""` to make permanent |
+
+**Notes:**
+- All fields are optional — only provided fields are updated
+- Setting `expires_at` to `"null"` or `""` clears the expiry (permanent block)
+- Changing `active` sets `synced_to_rspamd = false` to trigger re-sync
+
+---
+
+#### DELETE /api/suppressions/{suppression_id}
+
+Permanently delete a suppression entry.
+
+**Response:**
+```json
+{
+  "deleted": true,
+  "email": "user@example.com",
+  "was_active": true
+}
+```
+
+---
+
+#### POST /api/suppressions/import
+
+Bulk import suppressions from CSV data.
+
+**Request Body:** Multipart form with CSV file
+
+**CSV Format:**
+```csv
+email,type,reason,notes
+user@example.com,email,manual,Imported entry
+/.+@spam\.com/i,domain,manual,Domain block
+```
+
+**Response:**
+```json
+{
+  "imported": 10,
+  "skipped": 2,
+  "errors": ["Row 5: Invalid email format"]
+}
+```
+
+---
+
+#### GET /api/suppressions/export
+
+Export all suppressions as CSV download.
+
+**Response:** CSV file download with headers `email,type,reason,source,notes,active,bounce_count,expires_at,created_at`
+
+---
+
+#### POST /api/suppressions/sync
+
+Manually trigger sync of active suppressions to Rspamd's `global_rcpt_blacklist.map`.
+
+**Response:**
+```json
+{
+  "success": true,
+  "synced": 120,
+  "message": "Synced 120 entries to Rspamd"
+}
+```
+
+**Notes:**
+- Only active, non-expired entries are synced
+- Managed entries are placed between markers in the map file
+- Manual entries above the markers are preserved
+- Requires both `RSPAMD_PASSWORD` and `MAILCOW_API_KEY_RW`
+
+---
+
+## Quarantine Auto-Rules
+
+Manage quarantine auto-rules that automatically release or delete quarantined emails based on matching patterns. All endpoints require a Read-Write API key (`MAILCOW_API_KEY_RW`).
+
+### GET /api/quarantine/rules
+
+List all quarantine rules.
+
+**Response:**
+```json
+{
+  "total": 2,
+  "data": [
+    {
+      "id": 1,
+      "name": "Allow billing emails",
+      "match_type": "sender",
+      "match_value": "billing@example.com",
+      "is_regex": false,
+      "action": "release",
+      "enabled": true,
+      "hit_count": 42,
+      "last_hit_at": "2026-04-21T10:30:00Z",
+      "notes": "Trusted billing sender",
+      "created_at": "2026-04-20T08:00:00Z",
+      "updated_at": "2026-04-21T10:30:00Z"
+    }
+  ]
+}
+```
+
+**Response Fields:**
+- `match_type`: One of `sender`, `sender_domain`, `recipient`, `subject`
+- `is_regex`: Whether `match_value` is a regex pattern
+- `action`: `release` (deliver to inbox) or `delete` (permanently remove)
+- `hit_count`: Number of quarantine items matched by this rule
+- `last_hit_at`: Timestamp of the last match
+
+---
+
+### POST /api/quarantine/rules
+
+Create a new quarantine rule.
+
+**Request Body:**
+```json
+{
+  "name": "Block spam domain",
+  "match_type": "sender_domain",
+  "match_value": "spammer.com",
+  "is_regex": false,
+  "action": "delete",
+  "notes": "Known spam source"
+}
+```
+
+**Request Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Rule name (1-255 characters) |
+| `match_type` | string | Yes | `sender`, `sender_domain`, `recipient`, or `subject` |
+| `match_value` | string | Yes | Value or regex pattern to match (1-500 characters) |
+| `is_regex` | boolean | No | Whether `match_value` is a regex (default: false) |
+| `action` | string | Yes | `release` or `delete` |
+| `notes` | string | No | Optional description |
+
+**Response:** The created rule object (same format as GET response)
+
+**Error Responses:**
+- `400 Bad Request`: Invalid match_type, action, or regex pattern
+- `403 Forbidden`: No Read-Write API key configured
+
+---
+
+### PUT /api/quarantine/rules/{id}
+
+Update an existing quarantine rule. Only provided fields are updated.
+
+**Request Body (partial update):**
+```json
+{
+  "name": "Updated name",
+  "enabled": false
+}
+```
+
+**Response:** The updated rule object
+
+**Error Responses:**
+- `404 Not Found`: Rule not found
+- `400 Bad Request`: Invalid field values
+
+---
+
+### DELETE /api/quarantine/rules/{id}
+
+Delete a quarantine rule permanently.
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Rule 'Block spam domain' deleted"
+}
+```
+
+---
+
+### POST /api/quarantine/rules/{id}/toggle
+
+Toggle a rule's enabled/disabled state.
+
+**Response:** The updated rule object with `enabled` toggled
+
+---
+
+### POST /api/quarantine/rules/test
+
+Dry-run test all rules (enabled and disabled) against current quarantine items. No actions are taken.
+
+**Response:**
+```json
+{
+  "total_quarantine": 15,
+  "total_matches": 3,
+  "matches": [
+    {
+      "quarantine_id": "12345",
+      "sender": "spam@bad.com",
+      "recipient": "user@example.com",
+      "subject": "You won a prize!",
+      "rule_id": 1,
+      "rule_name": "Block bad.com",
+      "action": "delete",
+      "rule_enabled": true
+    }
+  ]
+}
+```
+
+**Response Fields:**
+- `rule_enabled`: `true` if the rule is active, `false` if disabled (match shown but won't execute)
+- Results include matches from disabled rules so users can test before enabling
+
+**Notes:**
+- Delete rules are checked before release rules (delete always wins)
+- Each quarantine item is matched against the first matching rule only
+- No quarantine items are modified
+
+---
+
+### GET /api/quarantine/rules/logs
+
+Get quarantine rule action history (paginated).
+
+**Query Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | `50` | Max results (max: 200) |
+| `offset` | integer | `0` | Pagination offset |
+| `rule_id` | integer | (none) | Filter by specific rule ID |
+
+**Response:**
+```json
+{
+  "total": 100,
+  "data": [
+    {
+      "id": 1,
+      "rule_id": 2,
+      "rule_name": "Block spam domain",
+      "action": "delete",
+      "quarantine_id": "12345",
+      "sender": "spam@bad.com",
+      "recipient": "user@example.com",
+      "subject": "Buy now!",
+      "matched_field": "sender_domain",
+      "matched_value": "bad.com",
+      "created_at": "2026-04-21T10:30:00Z"
+    }
+  ]
+}
+```
+
+**Notes:**
+- Logs are automatically pruned based on `QUARANTINE_RULES_LOG_RETENTION_DAYS` (default: 30)
+- Each entry represents one automated action taken by the scheduler

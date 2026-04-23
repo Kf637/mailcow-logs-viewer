@@ -167,6 +167,64 @@ Settings for the background raw log collector that powers the Logs page. Logs ar
 
 ---
 
+## Rspamd Integration
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `RSPAMD_PASSWORD` | string | (empty) | Rspamd UI/API password for reading and writing Rspamd map data. Found in mailcow's `mailcow.conf` as `RSPAMD_PASSWORD` or via the mailcow admin UI. Required for the Spam Filter maps editor |
+
+---
+
+## Spam Suppression Configuration
+
+Settings for the automatic email suppression feature. When enabled, the system monitors Postfix logs for hard bounces and the live mail queue for stuck deferred emails, automatically blocking future delivery attempts via Rspamd.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `SUPPRESSION_ENABLED` | boolean | `false` | Master switch for the suppression system. When enabled, bounced/rejected recipients are automatically blocked from receiving future emails |
+| `SUPPRESSION_AUTO_DETECT` | boolean | `true` | Automatically scan Postfix logs to detect hard bounce (5.x.x) errors and add recipients to the suppression list |
+| `SUPPRESSION_RSPAMD_SYNC` | boolean | `true` | Sync the suppression list to Rspamd's `global_rcpt_blacklist.map` so blocked emails are rejected at SMTP level. Requires `RSPAMD_PASSWORD` and `MAILCOW_API_KEY_RW` |
+| `SUPPRESSION_WHITELIST_DOMAINS` | string | (empty) | Domains that should never be suppressed, even if they bounce. Comma-separated (e.g., `gmail.com,outlook.com`) |
+| `SUPPRESSION_HARD_BOUNCE_ACTION` | string | `suppress` | What to do when a permanent delivery failure (5.x.x) is detected: `suppress` (block the recipient immediately) or `ignore` (do nothing) |
+| `SUPPRESSION_SOFT_BOUNCE_ACTION` | string | `count` | What to do when a temporary delivery failure (4.x.x) is detected in Postfix logs: `suppress` (block immediately), `count` (block after reaching threshold), or `ignore` (do nothing). Note: deferred emails stuck in the queue are handled separately by Queue Cleanup below |
+| `SUPPRESSION_SOFT_BOUNCE_THRESHOLD` | integer | `3` | How many soft bounces from Postfix logs before the recipient is suppressed (only used when `SUPPRESSION_SOFT_BOUNCE_ACTION=count`) |
+| `SUPPRESSION_BASE_EXPIRY_DAYS` | integer | `7` | How long to block a recipient in days. Multiplied by bounce count for repeat offenders (e.g., 7 × 3 bounces = 21 days). Used by all suppression types (hard bounces, soft bounces, and queue cleanup) |
+| `SUPPRESSION_MAX_EXPIRY_DAYS` | integer | `90` | Maximum block duration cap in days, regardless of bounce count |
+
+### Deferred Queue Cleanup
+
+Automatically monitors the live mail queue for deferred emails that have been stuck longer than a configurable threshold. When a stuck email is found, it is deleted from the queue and the recipient is suppressed. This catches soft bounces that may be missed by log-based detection on busy servers.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `QUEUE_CLEANUP_ENABLED` | boolean | `true` | Automatically monitor the mail queue for stuck deferred emails. If an email has been deferred longer than the threshold, it is deleted and the recipient is suppressed |
+| `QUEUE_CLEANUP_THRESHOLD_MINUTES` | integer | `60` | How long (in minutes) a deferred email must be stuck in the queue before it is automatically deleted and the recipient suppressed |
+
+> **Prerequisites:**
+> - `SUPPRESSION_ENABLED=true` — Queue cleanup is part of the suppression system
+> - `MAILCOW_API_KEY_RW` — Required for deleting queue items and syncing to Rspamd maps
+> - `RSPAMD_PASSWORD` — Required for reading/writing Rspamd map files
+> - Block duration uses `SUPPRESSION_BASE_EXPIRY_DAYS` with progressive expiry
+
+---
+
+## Quarantine Auto-Rules Configuration
+
+Settings for the automatic quarantine rule processing feature. When rules are defined and a Read-Write API key is configured, the system periodically checks quarantine items against user-defined rules and automatically releases or deletes matching emails.
+
+| Variable | Type | Default | Description |
+|----------|------|---------|-------------|
+| `QUARANTINE_RULES_MAX_ACTIONS` | integer | `50` | Safety limit: maximum emails to release/delete per scheduler run. Prevents accidental mass-processing from overly broad rules. Set lower for cautious environments |
+| `QUARANTINE_RULES_INTERVAL` | integer | `5` | Minutes between quarantine rule processing runs. Lower = faster response to new quarantine items, higher = less API load on mailcow |
+| `QUARANTINE_RULES_LOG_RETENTION_DAYS` | integer | `30` | Days to keep quarantine auto-rule action history. Older logs are automatically cleaned up |
+
+> **Prerequisites:**
+> - `MAILCOW_API_KEY_RW` — Required for releasing and deleting quarantine items
+> - Rules are managed from the Quarantine page in the web UI (not via environment variables)
+> - If no rules are defined or no RW key is configured, the background job simply does nothing
+
+---
+
 ## Authentication Configuration
 
 ### Basic HTTP Authentication

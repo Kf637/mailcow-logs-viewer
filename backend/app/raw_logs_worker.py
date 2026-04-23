@@ -14,6 +14,7 @@ Architecture:
 import logging
 import hashlib
 import json
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Any
 
@@ -229,6 +230,9 @@ async def fetch_raw_service_logs():
         raw_logs_job_status['fetch_raw_logs']['stats'] = stats
         raw_logs_job_status['fetch_raw_logs']['error'] = None
         
+    except asyncio.CancelledError:
+        logger.info("[RAW LOGS] Fetch cycle cancelled by shutdown")
+        return
     except Exception as e:
         logger.error(f"[RAW LOGS] Fetch cycle error: {e}")
         raw_logs_job_status['fetch_raw_logs']['status'] = 'failed'

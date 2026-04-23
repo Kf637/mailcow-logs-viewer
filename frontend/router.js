@@ -10,6 +10,7 @@ const VALID_ROUTES = [
     'netfilter',
     'queue',
     'quarantine',
+    'spam-filter',
     'status',
     'domains',
     'dmarc',
@@ -234,7 +235,8 @@ const TAB_LABELS = {
     'dmarc': 'DMARC',
     'mailbox-stats': 'Mailbox Stats',
     'logs': 'Logs',
-    'settings': 'Settings'
+    'settings': 'Settings',
+    'spam-filter': 'Spam Filter'
 };
 
 /**
