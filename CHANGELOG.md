@@ -5,7 +5,88 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.5.0] - 2026-04-22
+## [2.6.0] - 2026-05-06
+
+### Added
+
+#### Dynamic Feature Toggles
+- **Enable or disable application features on-the-fly** from the Settings page without requiring a restart
+  - Toggle individual features: Security (Netfilter/Fail2Ban), Queue, Quarantine, Spam Filter, Domains, DMARC, Mailbox Statistics, Logs, Blacklist Monitor
+  - Page auto-reloads after toggling features so all UI changes take effect immediately
+
+#### Feature Toggle — UI Integration
+- **Navigation tabs** are dynamically hidden/shown based on enabled features
+- **Settings page**: Related settings tabs (DMARC, DMARC IMAP, Logs, Spam Filter, Quarantine) are hidden when their feature is disabled
+
+#### Feature Toggle — Background Job Guards
+- **Runtime feature checks** added to all feature-specific background jobs — disabling a feature immediately stops its related jobs without restart
+  - Previously, feature checks only occurred at startup (job registration). Now each job verifies its feature is still enabled at every execution
+
+#### Feature Toggle — Status Page
+- **"Feature Off" badge** on background job cards for disabled features
+
+#### Data Purge on Feature Disable
+- **Disabling a feature now purges all related data** from the database (with confirmation warning)
+
+#### Quarantine — Rspamd Training Actions
+- **Learn Not Spam**: Release a quarantined message and train Rspamd that it is not spam
+- **Learn Spam**: Delete a quarantined message and train Rspamd that it is spam
+
+#### Quarantine — Email Detail Modal
+- **Full email details view** — click "Details" or the subject line to open a modal with:
+  - Header info: Subject, From (Header), Envelope From, Recipients (with type badges), Score, Action
+  - Rspamd Symbols table sorted by absolute score impact; score-0 symbols in a collapsed accordion
+  - Email content preview (plain text or HTML body)
+
+### Changed
+
+#### Paginated Log Synchronization
+- **Full history import** — Postfix and Rspamd logs are now fetched using paginated API calls, importing the entire mailcow log history instead of only the most recent batch
+  - Fetches logs in configurable page sizes (`FETCH_COUNT_POSTFIX`, `FETCH_COUNT_RSPAMD`) with offset-based pagination
+  - Postfix and Rspamd run in parallel via `asyncio.gather` for faster data population
+- **Log discovery via binary-search probing** — Before fetching begins, the system probes the mailcow API at progressively finer positions (100k → 10k → 1k → 100 → 10 → 1) to determine exactly how many logs exist, enabling accurate progress logging (`Page 5/250 (2%)`) and eliminating blind pagination
+- **Configurable page limit** (`FETCH_MAX_PAGES`, default: 50) — Safety cap on pages per cycle. When the limit is reached, the current offset is saved and the next cycle resumes from exactly where it left off, ensuring complete ingestion across multiple runs
+- **Early stop on catch-up** — If an entire page contains only duplicates (no new logs), fetching stops early instead of scanning remaining pages unnecessarily
+- **Batch existence pre-check** — Each page of logs is checked against the database in a single query before insertion, preventing `UniqueViolation` errors without relying on database-level exception handling
+- **Blacklist filtering during ingestion** — Logs matching blacklisted email addresses (`BLACKLIST_EMAILS`) are filtered out during import and their related database records are cleaned up
+
+### Fixed
+
+#### GeoIP Error When MaxMind Not Configured
+- **`ERROR - Failed to load GeoIP City database` on every startup**: When MaxMind credentials are not configured, stale or empty `.mmdb` files in the data directory caused repeated ERROR-level log messages. The system now checks that database files are non-empty before attempting to load them, downgrades the message to DEBUG level, and marks GeoIP as unavailable so it does not retry
+
+#### Mailbox Stats — Case-Insensitive Email Matching
+- **Alias/mailbox message counts ignored letter case**: If an alias was stored as `test@domain.com` but a message was sent from `TEST@domain.com`, it would not be counted in the mailbox statistics. All sender/recipient comparisons in the mailbox stats module now use case-insensitive matching
+
+#### Mailbox Stats — Query Performance Issue
+- **Page took minutes to load and froze on search**: Message counting was done individually for each mailbox and alias, causing hundreds of database queries per page load. Now all counts are calculated in bulk using just 2 queries total, making the page load in seconds
+
+#### Messages — Incorrect Timestamp Displayed
+- **All messages showed the same date/time**: The messages page displayed `last_seen` (when the system processed the correlation) instead of `first_seen` (the actual email timestamp from Rspamd). This caused all messages imported in the same batch to show identical times. Now displays the real email time and sorts by it
+
+### Technical
+
+#### New Configuration Settings
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `DISABLED_FEATURES` | `""` (empty) | Comma-separated list of features to disable. Valid values: `netfilter`, `queue`, `quarantine`, `spam-filter`, `domains`, `dmarc`, `mailbox-stats`, `logs`, `blacklist` |
+| `FETCH_MAX_PAGES` | `50` | Maximum number of pages to fetch per cycle for Postfix/Rspamd (safety limit to prevent infinite loops) |
+
+#### API Changes
+- `GET /api/info` now includes `disabled_features` array in the response — lists all currently disabled feature IDs
+- `GET /api/settings/info` background jobs include `feature_disabled: true` for jobs whose feature is turned off
+- `POST /api/settings/purge-feature-data` — new endpoint to delete all database data for a disabled feature (body: `{ "feature": "<id>" }`)
+
+#### New API Endpoints
+```
+POST /api/quarantine/learnham          - Release & train as not spam (requires RW API key)
+POST /api/quarantine/learnspam         - Delete & train as spam (requires RW API key)
+GET  /api/quarantine/{id}/details      - Get full quarantine item details (proxied from mailcow)
+```
+
+---
+
+## [2.5.0] - 2026-04-23
 
 ### Added
 

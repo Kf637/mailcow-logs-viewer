@@ -144,6 +144,8 @@ function navigateTo(route, params = {}, updateHistory = true) {
         params = {};
     }
 
+    // Note: disabled feature guard is in switchTab() which shows a "Feature Disabled" page
+
     // Build the new path
     const newPath = buildPath(route, params);
 

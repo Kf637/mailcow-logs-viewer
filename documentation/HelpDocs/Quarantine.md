@@ -14,8 +14,18 @@ Each quarantined email shows:
 If a Read-Write API key (`MAILCOW_API_KEY_RW`) is configured, you can:
 - **Release** — deliver the email to the recipient's inbox
 - **Delete** — permanently remove the email from quarantine
+- **Not Spam** — release the email AND train Rspamd that it is legitimate (improves future filtering)
+- **Spam** — delete the email AND train Rspamd that it is spam (improves future filtering)
 - **Rule** — create an auto-rule pre-filled with this email's data
-- **Select All / Bulk Actions** — release or delete multiple items at once
+- **Select All / Bulk Actions** — release, delete, mark as not spam, or mark as spam for multiple items at once
+
+### Email Details
+Click **Details** or the email subject to open a detail modal showing:
+- **Subject, From, Envelope From, Recipients** — full header info with click-to-copy
+- **Score & Action** — the spam score and the action that was taken
+- **Rspamd Symbols** — a table of all Rspamd rules that matched, sorted by score impact. Symbols with a score of 0 (informational only) are collapsed in an accordion
+- **Email Content** — preview of the email body (plain text or HTML)
+- **Action Buttons** — Release, Delete, Not Spam, Spam buttons in a sticky footer at the bottom of the modal
 
 ## Quarantine Auto-Rules
 

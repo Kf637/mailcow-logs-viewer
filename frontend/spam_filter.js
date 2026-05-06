@@ -885,7 +885,7 @@ async function toggleSuppression(id, newActive) {
 }
 
 async function deleteSuppression(id, email) {
-    if (!confirm(`Delete suppression for ${email}? This cannot be undone.`)) return;
+    if (!await showConfirmModal({ title: 'Delete Suppression', message: `Delete suppression for ${email}? This cannot be undone.`, confirmText: 'Delete', isDangerous: true })) return;
     
     try {
         const response = await authenticatedFetch(`/api/suppressions/${id}`, { method: 'DELETE' });

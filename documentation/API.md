@@ -161,7 +161,7 @@ Application information and configuration.
 ```json
 {
   "name": "mailcow Logs Viewer",
-  "version": "2.2.5",
+  "version": "2.6.0",
   "mailcow_url": "https://mail.example.com",
   "local_domains": ["example.com", "mail.example.com"],
   "fetch_interval": 60,
@@ -172,7 +172,8 @@ Application information and configuration.
   "blacklist_count": 3,
   "auth_enabled": true,
   "basic_auth_enabled": true,
-  "oauth2_enabled": false
+  "oauth2_enabled": false,
+  "disabled_features": ["quarantine", "spam-filter"]
 }
 ```
 
@@ -180,6 +181,7 @@ Application information and configuration.
 - `auth_enabled`: Boolean - Whether any authentication is enabled
 - `basic_auth_enabled`: Boolean - Whether Basic Authentication is enabled
 - `oauth2_enabled`: Boolean - Whether OAuth2/OIDC authentication is enabled
+- `disabled_features`: Array of strings - List of currently disabled feature IDs. Valid values: `netfilter`, `queue`, `quarantine`, `spam-filter`, `domains`, `dmarc`, `mailbox-stats`, `logs`, `blacklist`. Empty array if all features are enabled
 
 ---
 
@@ -1821,6 +1823,147 @@ Permanently delete quarantined messages on mailcow. Requires a Read-Write API ke
 
 ---
 
+### POST /quarantine/learnham
+
+Release quarantined messages and train Rspamd that they are **not spam** (ham). Requires a Read-Write API key (`MAILCOW_API_KEY_RW`).
+
+**Request Body:**
+```json
+{
+  "items": ["123"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `items` | string[] | Yes | Array of quarantine item ID strings |
+
+**Response (Success):**
+```json
+{
+  "status": "success",
+  "msg": "Message(s) released & marked as not spam"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request`: Missing `items` array
+- `500 Internal Server Error`: RW API key not configured or mailcow API error
+
+**Notes:**
+- Proxies to mailcow `POST /api/v1/edit/qitem` with `{"items": [...], "attr": {"action": "learnham"}}`
+- The message is released to the recipient's mailbox AND Rspamd is trained to recognize similar messages as legitimate
+- Supports multiple items in a single request
+
+---
+
+### POST /quarantine/learnspam
+
+Delete quarantined messages and train Rspamd that they are **spam**. Requires a Read-Write API key (`MAILCOW_API_KEY_RW`).
+
+**Request Body:**
+```json
+{
+  "items": ["123"]
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `items` | string[] | Yes | Array of quarantine item ID strings |
+
+**Response (Success):**
+```json
+{
+  "status": "success",
+  "msg": "Message(s) deleted & marked as spam"
+}
+```
+
+**Error Responses:**
+- `400 Bad Request`: Missing `items` array
+- `500 Internal Server Error`: RW API key not configured or mailcow API error
+
+**Notes:**
+- Proxies to mailcow `POST /api/v1/edit/qitem` with `{"items": [...], "attr": {"action": "learnspam"}}`
+- The message is permanently deleted AND Rspamd is trained to recognize similar messages as spam
+- Supports multiple items in a single request
+
+---
+
+### GET /quarantine/{item_id}/details
+
+Get detailed information about a specific quarantine item, including full email headers, Rspamd symbols with scores, email body content, and fuzzy hashes. Proxies mailcow's `qitem_details.php`.
+
+**Path Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `item_id` | string | Quarantine item ID |
+
+**Response:**
+```json
+{
+  "recipients": [
+    {"address": "user@example.com", "type": "to"},
+    {"address": "user@example.com", "type": "smtp"}
+  ],
+  "header_from": "Sender Name <sender@example.com>",
+  "env_from": "sender@example.com",
+  "score": 9.72,
+  "action": "add header",
+  "symbols": [
+    {
+      "group": "hfilter",
+      "name": "HFILTER_URL_ONLY",
+      "groups": ["hfilter"],
+      "weight": 8.2,
+      "score": 8.2,
+      "options": ["1"]
+    },
+    {
+      "group": "headers",
+      "name": "FROM_HAS_DN",
+      "groups": ["headers"],
+      "weight": 0,
+      "score": 0,
+      "options": []
+    }
+  ],
+  "subject": "Test email",
+  "text_plain": "Email body content...",
+  "text_html": null,
+  "fuzzy_hashes": [
+    {"type": "text", "hash": "abc123..."}
+  ]
+}
+```
+
+**Response Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `recipients` | array | List of recipients with `address` and `type` (to/smtp) |
+| `header_from` | string | Display name and address from email header |
+| `env_from` | string | Envelope sender address |
+| `score` | float | Rspamd spam score |
+| `action` | string | Action taken (e.g., "add header", "reject") |
+| `symbols` | array | Rspamd symbols with group, name, score, and options |
+| `subject` | string | Email subject line |
+| `text_plain` | string/null | Plain text email body |
+| `text_html` | string/null | HTML email body |
+| `fuzzy_hashes` | array | Fuzzy hash data for the email |
+
+**Error Responses:**
+- `502 Bad Gateway`: Failed to fetch details from mailcow
+
+**Notes:**
+- Proxies to mailcow's `/inc/ajax/qitem_details.php?id={item_id}` using the API key for authentication
+- The response is the first element of the array returned by mailcow
+- Used by the frontend's email detail modal
+
+---
+
 ## Statistics
 
 ### GET /stats/dashboard
@@ -2617,6 +2760,84 @@ Migrates all current effective settings (from defaults + ENV + existing DB) into
 - `env_locked_keys` shows which fields are controlled by ENV and cannot be overridden from the UI
 - After migration, settings are managed via UI and stored in database
 - `SETTINGS_EDIT_VIA_UI_ENABLED` must remain in ENV (not stored in DB)
+
+---
+
+### POST /api/settings/purge-feature-data
+
+Delete all database data associated with a disabled feature.
+
+**Description:**
+When a feature is disabled, this endpoint permanently deletes all stored data from that feature's database tables. The feature must already be disabled (in `disabled_features`). Only available when `SETTINGS_EDIT_VIA_UI_ENABLED=true`.
+
+**Authentication:** Required
+
+**Request Body:**
+```json
+{
+  "feature": "dmarc"
+}
+```
+
+**Request Fields:**
+- `feature`: Feature ID to purge. Valid values: `netfilter`, `domains`, `dmarc`, `mailbox-stats`, `logs`, `blacklist`, `spam-filter`, `quarantine`
+
+**Feature → Tables Mapping:**
+
+| Feature | Tables Truncated |
+|---------|-----------------|
+| `netfilter` | `netfilter_logs` |
+| `domains` | `domain_dns_checks` |
+| `dmarc` | `dmarc_reports`, `dmarc_records`, `dmarc_syncs`, `tls_reports`, `tls_report_policies` |
+| `mailbox-stats` | `mailbox_statistics`, `alias_statistics` |
+| `logs` | `raw_service_logs` |
+| `blacklist` | `blacklist_checks`, `monitored_hosts` |
+| `spam-filter` | `spam_suppressions` |
+| `quarantine` | `quarantine_rules`, `quarantine_rule_logs` |
+
+**Response:**
+```json
+{
+  "feature": "dmarc",
+  "tables_purged": {
+    "dmarc_records": 1523,
+    "tls_report_policies": 42,
+    "dmarc_reports": 87,
+    "dmarc_syncs": 12,
+    "tls_reports": 15
+  },
+  "total_rows_deleted": 1679
+}
+```
+
+**Error Responses:**
+
+**400 Bad Request** (unknown feature):
+```json
+{
+  "detail": "Unknown feature: invalid-feature"
+}
+```
+
+**400 Bad Request** (feature is still enabled):
+```json
+{
+  "detail": "Feature 'dmarc' is currently enabled. Disable it first."
+}
+```
+
+**403 Forbidden** (UI editing disabled):
+```json
+{
+  "detail": "Editing settings from UI is disabled."
+}
+```
+
+**Notes:**
+- Tables are truncated with `CASCADE` to handle foreign key relationships
+- The frontend automatically calls this endpoint after saving settings with newly disabled features
+- A confirmation dialog warns the user before disabling a feature that data will be deleted
+- Features without database tables (e.g., `queue`) are not purgeable — the endpoint returns 400 for unknown features
 
 ---
 

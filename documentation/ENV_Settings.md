@@ -48,6 +48,7 @@ These settings **must** be configured in your `.env` file:
 | `FETCH_COUNT_POSTFIX` | integer | `2000` | Number of Postfix records to fetch per request. Recommended: 500-2000 for most servers, increase if you have high email volume |
 | `FETCH_COUNT_RSPAMD` | integer | `500` | Number of Rspamd records to fetch per request |
 | `FETCH_COUNT_NETFILTER` | integer | `500` | Number of Netfilter records to fetch per request |
+| `FETCH_MAX_PAGES` | integer | `50` | Maximum number of pages to fetch per cycle for Postfix/Rspamd (safety limit to prevent infinite loops) |
 | `RETENTION_DAYS` | integer | `7` | Number of days to keep logs in database. Logs older than this will be automatically deleted. Recommended: 7 for most cases, 30 for compliance/audit requirements |
 
 ---
@@ -72,6 +73,7 @@ These settings **must** be configured in your `.env` file:
 | `MAX_SEARCH_RESULTS` | integer | `1000` | Maximum records to return in search results |
 | `CSV_EXPORT_LIMIT` | integer | `10000` | CSV export row limit |
 | `SCHEDULER_WORKERS` | integer | `4` | Thread pool size for blocking scheduler jobs (e.g. DMARC IMAP sync). Valid range: 1-64. Higher values allow more blocking jobs to run in parallel |
+| `DISABLED_FEATURES` | string | (empty) | Comma-separated list of features to disable (hides navigation, stops background jobs). Valid values: `netfilter`, `queue`, `quarantine`, `spam-filter`, `domains`, `dmarc`, `mailbox-stats`, `logs`, `blacklist`. Can also be managed from the Settings UI when `SETTINGS_EDIT_VIA_UI_ENABLED=true` |
 
 ---
 

@@ -99,6 +99,11 @@ async def fetch_raw_service_logs():
     raw_logs_job_status['fetch_raw_logs']['status'] = 'running'
     raw_logs_job_status['fetch_raw_logs']['last_run'] = datetime.now(timezone.utc)
     
+    # Runtime feature check — skip if logs feature was disabled after startup
+    if not settings.is_feature_enabled('logs') or not settings.raw_logs_enabled:
+        raw_logs_job_status['fetch_raw_logs']['status'] = 'success'
+        return
+    
     try:
         enabled_services = settings.raw_logs_services_list
         if not enabled_services:
@@ -264,6 +269,11 @@ async def cleanup_raw_service_logs():
     raw_logs_job_status['cleanup_raw_logs']['status'] = 'running'
     raw_logs_job_status['cleanup_raw_logs']['last_run'] = datetime.now(timezone.utc)
     
+    # Runtime feature check
+    if not settings.is_feature_enabled('logs') or not settings.raw_logs_enabled:
+        raw_logs_job_status['cleanup_raw_logs']['status'] = 'success'
+        return
+    
     try:
         retention_days = settings.raw_logs_retention_days
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=retention_days)
@@ -289,8 +299,9 @@ async def cleanup_raw_service_logs():
 
 def start_raw_logs_scheduler():
     """Start the raw logs background scheduler (called from main.py startup)"""
-    if not settings.raw_logs_enabled:
-        logger.info("[RAW LOGS] Raw logs collection is disabled (RAW_LOGS_ENABLED=false)")
+    if not settings.raw_logs_enabled or not settings.is_feature_enabled('logs'):
+        reason = "RAW_LOGS_ENABLED=false" if not settings.raw_logs_enabled else "Logs feature disabled"
+        logger.info(f"[RAW LOGS] Raw logs collection is disabled ({reason})")
         return
     
     try:

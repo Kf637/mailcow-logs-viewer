@@ -47,15 +47,19 @@ class Settings(BaseSettings):
     fetch_interval: int = Field(default=60, description="Seconds between log fetches")
     fetch_count_postfix: int = Field(
         default=2000, 
-        description="Postfix logs to fetch per request"
+        description="Postfix logs to fetch per API request (page size for paginated fetching)"
     )
     fetch_count_rspamd: int = Field(
         default=500, 
-        description="Rspamd logs to fetch per request"
+        description="Rspamd logs to fetch per API request (page size for paginated fetching)"
     )
     fetch_count_netfilter: int = Field(
         default=500, 
         description="Netfilter logs to fetch per request"
+    )
+    fetch_max_pages: int = Field(
+        default=50,
+        description="Maximum number of pages to fetch per cycle for Postfix/Rspamd (safety limit to prevent infinite loops)"
     )
     retention_days: int = Field(default=7, description="Days to keep logs")
     
@@ -88,6 +92,10 @@ class Settings(BaseSettings):
     )
     app_title: str = Field(default="mailcow Logs Viewer", description="Application title")
     app_logo_url: str = Field(default="", description="Application logo URL (optional)")
+    disabled_features: str = Field(
+        default="",
+        description="Comma-separated list of features to disable (hides page and stops related jobs). Valid: netfilter, queue, quarantine, spam-filter, domains, dmarc, mailbox-stats, logs, blacklist"
+    )
     
     # Settings UI: allow editing config from web UI (overrides stored in DB). ENV only; default False.
     # Field name avoids "settings_" prefix (Pydantic protected namespace).
@@ -606,6 +614,17 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def disabled_features_set(self) -> set:
+        """Parse disabled_features into a set of feature IDs."""
+        if not self.disabled_features:
+            return set()
+        return {f.strip().lower() for f in self.disabled_features.split(',') if f.strip()}
+
+    def is_feature_enabled(self, feature: str) -> bool:
+        """Check if a feature is enabled (not in disabled_features)."""
+        return feature not in self.disabled_features_set
     
     class Config:
         env_file = ".env"

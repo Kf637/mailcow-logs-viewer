@@ -104,8 +104,88 @@ def reschedule_interval_jobs():
             reschedule_raw_logs_jobs()
         except Exception as e:
             logger.warning(f"Failed to reschedule raw logs jobs: {e}")
+
+        # Reschedule suppression jobs based on current settings
+        _reschedule_suppression_jobs()
+
     except Exception as e:
         logger.warning("Failed to reschedule interval jobs: %s", e)
+
+
+def _reschedule_suppression_jobs():
+    """Add or remove suppression-related jobs based on current settings."""
+    if not scheduler.running:
+        return
+
+    spam_enabled = settings.is_feature_enabled('spam-filter') and settings.suppression_enabled
+
+    # detect_suppressions
+    if spam_enabled and settings.suppression_auto_detect:
+        scheduler.add_job(
+            detect_suppressions_job,
+            trigger=IntervalTrigger(minutes=5),
+            id='detect_suppressions',
+            name='Detect Suppressions',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("   [SPAM] Suppression detection: scheduled (every 5 minutes)")
+    else:
+        try:
+            scheduler.remove_job('detect_suppressions')
+        except Exception:
+            pass
+
+    # sync_suppressions
+    if spam_enabled and settings.suppression_rspamd_sync and settings.is_rspamd_configured:
+        scheduler.add_job(
+            sync_suppressions_to_rspamd_job,
+            trigger=IntervalTrigger(minutes=10),
+            id='sync_suppressions',
+            name='Sync Suppressions to Rspamd',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("   [SPAM] Rspamd sync: scheduled (every 10 minutes)")
+    else:
+        try:
+            scheduler.remove_job('sync_suppressions')
+        except Exception:
+            pass
+
+    # expire_suppressions
+    if spam_enabled:
+        scheduler.add_job(
+            expire_suppressions_job,
+            trigger=IntervalTrigger(hours=1),
+            id='expire_suppressions',
+            name='Expire Suppressions',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("   [SPAM] Expiry check: scheduled (every hour)")
+    else:
+        try:
+            scheduler.remove_job('expire_suppressions')
+        except Exception:
+            pass
+
+    # cleanup_deferred_queue
+    if spam_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key:
+        scheduler.add_job(
+            cleanup_deferred_queue_job,
+            trigger=IntervalTrigger(minutes=5),
+            id='cleanup_deferred_queue',
+            name='Cleanup Deferred Queue',
+            replace_existing=True,
+            max_instances=1
+        )
+        logger.info("   [SPAM] Deferred queue cleanup: scheduled (every 5 minutes)")
+    else:
+        try:
+            scheduler.remove_job('cleanup_deferred_queue')
+        except Exception:
+            pass
 
 # Job execution tracking
 job_status = {
@@ -264,6 +344,12 @@ seen_postfix: Set[str] = set()
 seen_rspamd: Set[str] = set()
 seen_netfilter: Set[str] = set()
 
+# Resume offsets: when max pages is hit, next cycle continues from here
+_resume_offset: Dict[str, int] = {
+    'postfix': 0,
+    'rspamd': 0,
+}
+
 last_fetch_run_time: Dict[str, Optional[datetime]] = {
     'postfix': None,
     'rspamd': None,
@@ -296,260 +382,437 @@ def is_blacklisted(email: Optional[str]) -> bool:
     return is_blocked
 
 
+async def _discover_total_logs(log_type: str) -> int:
+    """
+    Discover total number of available logs using progressive probing.
+    
+    Uses decreasing step sizes (100k -> 10k -> 1k) to narrow down the
+    total log count with minimal API calls (~30 probes max).
+    
+    Args:
+        log_type: 'postfix' or 'rspamd-history'
+    
+    Returns:
+        Approximate total log count (accurate within 1000)
+    """
+    position = 0
+    try:
+        for step in [100000, 10000, 1000, 100, 10, 1]:
+            while True:
+                probe_pos = position + step
+                exists = await mailcow_api.probe_log_position(log_type, probe_pos)
+                if exists:
+                    position = probe_pos
+                else:
+                    break
+    except asyncio.CancelledError:
+        logger.warning(f"[{log_type.upper()}] Log discovery cancelled (task timeout or shutdown)")
+        return 0
+    except Exception as e:
+        logger.warning(f"[{log_type.upper()}] Log discovery failed: {e}")
+        return 0
+    return position
+
+
 async def fetch_and_store_postfix():
-    """Fetch Postfix logs from API and store in DB"""
+    """Fetch Postfix logs from API and store in DB (paginated — fetches all available logs)"""
     last_fetch_run_time['postfix'] = datetime.now(timezone.utc)
     
+    page_size = settings.fetch_count_postfix
+    max_pages = settings.fetch_max_pages
+    offset = _resume_offset['postfix']
+    total_new = 0
+    total_skipped = 0
+    total_blacklisted = 0
+    page_num = 0
+    
     try:
-        logs = await mailcow_api.get_postfix_logs(count=settings.fetch_count_postfix)
+        # Discover total available logs in mailcow
+        total_available = await _discover_total_logs('postfix')
         
-        if not logs:
+        if total_available == 0:
+            logger.debug("[POSTFIX] No logs available in mailcow")
             return
         
-        with get_db_context() as db:
-            new_count = 0
-            skipped_count = 0
-            skipped_blacklist = 0
-            blacklisted_queue_ids: Set[str] = set()
+        # If resume offset is beyond total, reset
+        if offset >= total_available:
+            offset = 0
+            _resume_offset['postfix'] = 0
+        
+        remaining = total_available - offset
+        total_pages_needed = (remaining + page_size - 1) // page_size
+        pages_to_fetch = min(total_pages_needed, max_pages)
+        
+        if offset > 0:
+            logger.info(f"[POSTFIX] Resuming from offset {offset}")
+        logger.info(f"[POSTFIX] Total available: ~{total_available}, pages to fetch: {pages_to_fetch}/{total_pages_needed}")
+        
+        while page_num < pages_to_fetch:
+            page_num += 1
+            logs = await mailcow_api.get_postfix_logs_page(page_size=page_size, offset=offset)
             
-            for log_entry in logs:
-                message = log_entry.get('message', '')
-                parsed = parse_postfix_message(message)
-                queue_id = parsed.get('queue_id')
-                
-                if not queue_id:
-                    continue
-                
-                sender = parsed.get('sender')
-                recipient = parsed.get('recipient')
-                
-                if is_blacklisted(sender) or is_blacklisted(recipient):
-                    blacklisted_queue_ids.add(queue_id)
-                    logger.debug(f"Blacklist: Queue ID {queue_id} marked for deletion (sender={sender}, recipient={recipient})")
+            if not logs:
+                _resume_offset['postfix'] = 0
+                break
             
-            # Delete existing logs with blacklisted queue IDs
-            if blacklisted_queue_ids:
-                deleted_count = db.query(PostfixLog).filter(
-                    PostfixLog.queue_id.in_(blacklisted_queue_ids)
-                ).delete(synchronize_session=False)
-                
-                # Also delete correlations for these queue IDs
-                db.query(MessageCorrelation).filter(
-                    MessageCorrelation.queue_id.in_(blacklisted_queue_ids)
-                ).delete(synchronize_session=False)
-                
-                if deleted_count > 0:
-                    logger.info(f"[BLACKLIST] Deleted {deleted_count} Postfix logs for {len(blacklisted_queue_ids)} blacklisted queue IDs")
-                
-                db.commit()
+            page_new = 0
+            page_skipped = 0
+            page_blacklisted = 0
             
-            for log_entry in logs:
-                try:
-                    time_str = str(log_entry.get('time', ''))
+            with get_db_context() as db:
+                blacklisted_queue_ids: Set[str] = set()
+                
+                for log_entry in logs:
                     message = log_entry.get('message', '')
-                    unique_id = f"{time_str}:{message[:100]}"
-                    
-                    if unique_id in seen_postfix:
-                        skipped_count += 1
-                        continue
-                    
-                    # Parse message for fields
                     parsed = parse_postfix_message(message)
                     queue_id = parsed.get('queue_id')
                     
-                    # Skip if queue ID is blacklisted
-                    if queue_id and queue_id in blacklisted_queue_ids:
-                        skipped_blacklist += 1
-                        seen_postfix.add(unique_id)
+                    if not queue_id:
                         continue
-                    
-                    # Parse timestamp with timezone
-                    timestamp = datetime.fromtimestamp(
-                        int(log_entry.get('time', 0)),
-                        tz=timezone.utc
-                    )
                     
                     sender = parsed.get('sender')
                     recipient = parsed.get('recipient')
                     
-                    postfix_log = PostfixLog(
-                        time=timestamp,
-                        program=log_entry.get('program'),
-                        priority=log_entry.get('priority'),
-                        message=message,
-                        queue_id=queue_id,
-                        message_id=parsed.get('message_id'),
-                        sender=sender,
-                        recipient=recipient,
-                        status=parsed.get('status'),
-                        relay=parsed.get('relay'),
-                        delay=parsed.get('delay'),
-                        dsn=parsed.get('dsn'),
-                        raw_data=log_entry
-                    )
+                    if is_blacklisted(sender) or is_blacklisted(recipient):
+                        blacklisted_queue_ids.add(queue_id)
+                        logger.debug(f"Blacklist: Queue ID {queue_id} marked for deletion (sender={sender}, recipient={recipient})")
+                
+                if blacklisted_queue_ids:
+                    deleted_count = db.query(PostfixLog).filter(
+                        PostfixLog.queue_id.in_(blacklisted_queue_ids)
+                    ).delete(synchronize_session=False)
                     
-                    # Use SAVEPOINT so a duplicate-key failure only rolls back
-                    # this single INSERT, not the entire batch.
-                    nested = db.begin_nested()
+                    db.query(MessageCorrelation).filter(
+                        MessageCorrelation.queue_id.in_(blacklisted_queue_ids)
+                    ).delete(synchronize_session=False)
+                    
+                    if deleted_count > 0:
+                        logger.info(f"[BLACKLIST] Deleted {deleted_count} Postfix logs for {len(blacklisted_queue_ids)} blacklisted queue IDs")
+                    
+                    db.commit()
+                
+                # Batch existence check
+                existing_in_db: Set[str] = set()
+                times_in_batch = set()
+                for log_entry in logs:
+                    times_in_batch.add(datetime.fromtimestamp(int(log_entry.get('time', 0)), tz=timezone.utc))
+                
+                if times_in_batch:
+                    existing_rows = db.query(
+                        PostfixLog.time, PostfixLog.program, PostfixLog.queue_id, PostfixLog.message
+                    ).filter(
+                        PostfixLog.time.in_(list(times_in_batch))
+                    ).all()
+                    for row in existing_rows:
+                        dt = row.time.replace(tzinfo=timezone.utc) if row.time.tzinfo is None else row.time
+                        time_val = int(dt.timestamp())
+                        db_key = f"{time_val}|{row.program or ''}|{row.queue_id or ''}|{row.message or ''}"
+                        existing_in_db.add(db_key)
+                
+                for log_entry in logs:
                     try:
+                        time_str = str(log_entry.get('time', ''))
+                        message = log_entry.get('message', '')
+                        unique_id = f"{time_str}:{message[:100]}"
+                        
+                        if unique_id in seen_postfix:
+                            page_skipped += 1
+                            continue
+                        
+                        parsed = parse_postfix_message(message)
+                        queue_id = parsed.get('queue_id')
+                        
+                        if queue_id and queue_id in blacklisted_queue_ids:
+                            page_blacklisted += 1
+                            seen_postfix.add(unique_id)
+                            continue
+                        
+                        # Parse timestamp with timezone
+                        timestamp = datetime.fromtimestamp(
+                            int(log_entry.get('time', 0)),
+                            tz=timezone.utc
+                        )
+                        
+                        # Check if already exists in DB (pre-checked batch query)
+                        time_val = int(log_entry.get('time', 0))
+                        db_key = f"{time_val}|{log_entry.get('program', '')}|{queue_id or ''}|{message}"
+                        if db_key in existing_in_db:
+                            seen_postfix.add(unique_id)
+                            page_skipped += 1
+                            continue
+                        
+                        sender = parsed.get('sender')
+                        recipient = parsed.get('recipient')
+                        
+                        postfix_log = PostfixLog(
+                            time=timestamp,
+                            program=log_entry.get('program'),
+                            priority=log_entry.get('priority'),
+                            message=message,
+                            queue_id=queue_id,
+                            message_id=parsed.get('message_id'),
+                            sender=sender,
+                            recipient=recipient,
+                            status=parsed.get('status'),
+                            relay=parsed.get('relay'),
+                            delay=parsed.get('delay'),
+                            dsn=parsed.get('dsn'),
+                            raw_data=log_entry
+                        )
+                        
                         db.add(postfix_log)
-                        db.flush()
-                        nested.commit()
-                    except IntegrityError:
-                        nested.rollback()
                         seen_postfix.add(unique_id)
-                        skipped_count += 1
+                        page_new += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing Postfix log: {e}")
                         continue
-                    
-                    seen_postfix.add(unique_id)
-                    new_count += 1
-                    
-                except Exception as e:
-                    logger.error(f"Error processing Postfix log: {e}")
-                    db.rollback()
-                    continue
+                
+                db.commit()
             
-            db.commit()
+            total_new += page_new
+            total_skipped += page_skipped
+            total_blacklisted += page_blacklisted
             
-            if new_count > 0 or skipped_count > 0:
-                msg = f"[OK] Imported {new_count} Postfix logs"
-                if skipped_count > 0:
-                    msg += f" (skipped {skipped_count} duplicates)"
-                if skipped_blacklist > 0:
-                    msg += f" (skipped {skipped_blacklist} blacklisted)"
-                logger.info(msg)
+            pct = round(page_num / pages_to_fetch * 100)
+            if page_new > 0:
+                logger.info(f"[POSTFIX] Page {page_num}/{pages_to_fetch} ({pct}%): imported {page_new} new, skipped {page_skipped} duplicates")
             
-            if len(seen_postfix) > 10000:
-                seen_postfix.clear()
+            # Early stop: no new imports means we've caught up (duplicates + blacklisted = processed)
+            if page_new == 0:
+                logger.info(f"[POSTFIX] Page {page_num}/{pages_to_fetch}: all duplicates/blacklisted, caught up — stopping early")
+                _resume_offset['postfix'] = 0
+                break
+            
+            offset += len(logs)
+        
+        else:
+            # Loop completed without break
+            if pages_to_fetch < total_pages_needed:
+                _resume_offset['postfix'] = offset + page_size
+                logger.info(f"[POSTFIX] Completed {pages_to_fetch}/{total_pages_needed} pages, will resume from offset {_resume_offset['postfix']} next cycle")
+            else:
+                _resume_offset['postfix'] = 0
+        
+        if total_new > 0 or total_skipped > 0:
+            msg = f"[OK] Imported {total_new} Postfix logs across {page_num} page(s)"
+            if total_skipped > 0:
+                msg += f" (skipped {total_skipped} duplicates)"
+            if total_blacklisted > 0:
+                msg += f" (skipped {total_blacklisted} blacklisted)"
+            logger.info(msg)
+        
+        if len(seen_postfix) > 10000:
+            seen_postfix.clear()
     
     except Exception as e:
         logger.error(f"[ERROR] Postfix fetch error: {e}")
 
 
 async def fetch_and_store_rspamd():
-    """Fetch Rspamd logs from API and store in DB"""
+    """Fetch Rspamd logs from API and store in DB (paginated — fetches all available logs)"""
     last_fetch_run_time['rspamd'] = datetime.now(timezone.utc)
     
+    page_size = settings.fetch_count_rspamd
+    max_pages = settings.fetch_max_pages
+    offset = _resume_offset['rspamd']
+    total_new = 0
+    total_skipped = 0
+    total_blacklisted = 0
+    page_num = 0
+    
     try:
-        logs = await mailcow_api.get_rspamd_logs(count=settings.fetch_count_rspamd)
+        # Discover total available logs in mailcow
+        total_available = await _discover_total_logs('rspamd-history')
         
-        if not logs:
+        if total_available == 0:
+            logger.debug("[RSPAMD] No logs available in mailcow")
             return
         
-        with get_db_context() as db:
-            new_count = 0
-            skipped_blacklist = 0
-            blacklisted_message_ids: Set[str] = set()
+        # If resume offset is beyond total, reset
+        if offset >= total_available:
+            offset = 0
+            _resume_offset['rspamd'] = 0
+        
+        remaining = total_available - offset
+        total_pages_needed = (remaining + page_size - 1) // page_size
+        pages_to_fetch = min(total_pages_needed, max_pages)
+        
+        if offset > 0:
+            logger.info(f"[RSPAMD] Resuming from offset {offset}")
+        logger.info(f"[RSPAMD] Total available: ~{total_available}, pages to fetch: {pages_to_fetch}/{total_pages_needed}")
+        
+        while page_num < pages_to_fetch:
+            page_num += 1
+            logs = await mailcow_api.get_rspamd_logs_page(page_size=page_size, offset=offset)
             
-            for log_entry in logs:
-                try:
-                    unix_time = log_entry.get('unix_time', 0)
-                    message_id = log_entry.get('message-id', '')
-                    if message_id == 'undef' or not message_id:
-                        message_id = None
-                    sender = log_entry.get('sender_smtp')
-                    recipients = log_entry.get('rcpt_smtp', [])
-                    
-                    unique_id = f"{unix_time}:{message_id if message_id else 'no-id'}"
-                    
-                    if unique_id in seen_rspamd:
-                        continue
-                    
-                    if is_blacklisted(sender):
-                        skipped_blacklist += 1
-                        seen_rspamd.add(unique_id)
-                        if message_id:
-                            blacklisted_message_ids.add(message_id)
-                        continue
-                    
-                    if recipients and any(is_blacklisted(r) for r in recipients):
-                        skipped_blacklist += 1
-                        seen_rspamd.add(unique_id)
-                        if message_id:
-                            blacklisted_message_ids.add(message_id)
-                        continue
-                    
-                    timestamp = datetime.fromtimestamp(unix_time, tz=timezone.utc)
-                    direction = detect_direction(log_entry)
-                    
-                    rspamd_log = RspamdLog(
-                        time=timestamp,
-                        message_id=message_id,
-                        sender_smtp=sender,
-                        sender_mime=log_entry.get('sender_mime', sender),
-                        recipients_smtp=recipients,
-                        recipients_mime=log_entry.get('rcpt_mime', recipients),
-                        subject=log_entry.get('subject'),
-                        score=log_entry.get('score', 0.0),
-                        required_score=log_entry.get('required_score', 15.0),
-                        action=log_entry.get('action', 'unknown'),
-                        symbols=log_entry.get('symbols', {}),
-                        is_spam=(
-                            log_entry.get('action') in ['reject', 'add header', 'rewrite subject'] or
-                            'SPAM_TRAP' in log_entry.get('symbols', {})
-                        ),
-                        has_auth=('MAILCOW_AUTH' in log_entry.get('symbols', {})),
-                        direction=direction,
-                        ip=log_entry.get('ip'),
-                        user=log_entry.get('user'),
-                        size=log_entry.get('size'),
-                        raw_data=log_entry
-                    )
+            if not logs:
+                _resume_offset['rspamd'] = 0
+                break
+            
+            page_new = 0
+            page_skipped = 0
+            page_blacklisted = 0
+            
+            with get_db_context() as db:
+                blacklisted_message_ids: Set[str] = set()
+                
+                # Batch existence check
+                existing_in_db: Set[str] = set()
+                times_in_batch = set()
+                for log_entry in logs:
+                    times_in_batch.add(datetime.fromtimestamp(log_entry.get('unix_time', 0), tz=timezone.utc))
+                
+                if times_in_batch:
+                    existing_rows = db.query(
+                        RspamdLog.time, RspamdLog.message_id
+                    ).filter(
+                        RspamdLog.time.in_(list(times_in_batch))
+                    ).all()
+                    for row in existing_rows:
+                        dt = row.time.replace(tzinfo=timezone.utc) if row.time.tzinfo is None else row.time
+                        time_val = int(dt.timestamp())
+                        db_key = f"{time_val}:{row.message_id if row.message_id else 'no-id'}"
+                        existing_in_db.add(db_key)
+                
+                for log_entry in logs:
+                    try:
+                        unix_time = log_entry.get('unix_time', 0)
+                        message_id = log_entry.get('message-id', '')
+                        if message_id == 'undef' or not message_id:
+                            message_id = None
+                        sender = log_entry.get('sender_smtp')
+                        recipients = log_entry.get('rcpt_smtp', [])
+                        
+                        unique_id = f"{unix_time}:{message_id if message_id else 'no-id'}"
+                        
+                        if unique_id in seen_rspamd or unique_id in existing_in_db:
+                            seen_rspamd.add(unique_id)
+                            page_skipped += 1
+                            continue
+                        
+                        if is_blacklisted(sender):
+                            page_blacklisted += 1
+                            seen_rspamd.add(unique_id)
+                            if message_id:
+                                blacklisted_message_ids.add(message_id)
+                            continue
+                        
+                        if recipients and any(is_blacklisted(r) for r in recipients):
+                            page_blacklisted += 1
+                            seen_rspamd.add(unique_id)
+                            if message_id:
+                                blacklisted_message_ids.add(message_id)
+                            continue
+                        
+                        timestamp = datetime.fromtimestamp(unix_time, tz=timezone.utc)
+                        direction = detect_direction(log_entry)
+                        
+                        rspamd_log = RspamdLog(
+                            time=timestamp,
+                            message_id=message_id,
+                            sender_smtp=sender,
+                            sender_mime=log_entry.get('sender_mime', sender),
+                            recipients_smtp=recipients,
+                            recipients_mime=log_entry.get('rcpt_mime', recipients),
+                            subject=log_entry.get('subject'),
+                            score=log_entry.get('score', 0.0),
+                            required_score=log_entry.get('required_score', 15.0),
+                            action=log_entry.get('action', 'unknown'),
+                            symbols=log_entry.get('symbols', {}),
+                            is_spam=(
+                                log_entry.get('action') in ['reject', 'add header', 'rewrite subject'] or
+                                'SPAM_TRAP' in log_entry.get('symbols', {})
+                            ),
+                            has_auth=('MAILCOW_AUTH' in log_entry.get('symbols', {})),
+                            direction=direction,
+                            ip=log_entry.get('ip'),
+                            user=log_entry.get('user'),
+                            size=log_entry.get('size'),
+                            raw_data=log_entry
+                        )
 
-                    if geoip_service.is_geoip_available() and rspamd_log.ip:
-                        geo_info = geoip_service.lookup_ip(rspamd_log.ip)
-                        rspamd_log.country_code = geo_info.get('country_code')
-                        rspamd_log.country_name = geo_info.get('country_name')
-                        rspamd_log.city = geo_info.get('city')
-                        rspamd_log.asn = geo_info.get('asn')
-                        rspamd_log.asn_org = geo_info.get('asn_org')
+                        if geoip_service.is_geoip_available() and rspamd_log.ip:
+                            geo_info = geoip_service.lookup_ip(rspamd_log.ip)
+                            rspamd_log.country_code = geo_info.get('country_code')
+                            rspamd_log.country_name = geo_info.get('country_name')
+                            rspamd_log.city = geo_info.get('city')
+                            rspamd_log.asn = geo_info.get('asn')
+                            rspamd_log.asn_org = geo_info.get('asn_org')
+                        
+                        db.add(rspamd_log)
+                        seen_rspamd.add(unique_id)
+                        page_new += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing Rspamd log: {e}")
+                        continue
+                
+                if blacklisted_message_ids:
+                    correlations_to_delete = db.query(MessageCorrelation).filter(
+                        MessageCorrelation.message_id.in_(blacklisted_message_ids)
+                    ).all()
                     
-                    db.add(rspamd_log)
-                    seen_rspamd.add(unique_id)
-                    new_count += 1
+                    queue_ids_to_delete = set()
+                    for corr in correlations_to_delete:
+                        if corr.queue_id:
+                            queue_ids_to_delete.add(corr.queue_id)
                     
-                except Exception as e:
-                    logger.error(f"Error processing Rspamd log: {e}")
-                    continue
-            
-            if blacklisted_message_ids:
-                correlations_to_delete = db.query(MessageCorrelation).filter(
-                    MessageCorrelation.message_id.in_(blacklisted_message_ids)
-                ).all()
-                
-                queue_ids_to_delete = set()
-                for corr in correlations_to_delete:
-                    if corr.queue_id:
-                        queue_ids_to_delete.add(corr.queue_id)
-                
-                deleted_corr = db.query(MessageCorrelation).filter(
-                    MessageCorrelation.message_id.in_(blacklisted_message_ids)
-                ).delete(synchronize_session=False)
-                
-                if queue_ids_to_delete:
-                    deleted_postfix = db.query(PostfixLog).filter(
-                        PostfixLog.queue_id.in_(queue_ids_to_delete)
+                    deleted_corr = db.query(MessageCorrelation).filter(
+                        MessageCorrelation.message_id.in_(blacklisted_message_ids)
                     ).delete(synchronize_session=False)
                     
-                    if deleted_postfix > 0:
-                        logger.info(f"[BLACKLIST] Deleted {deleted_postfix} Postfix logs linked to blacklisted messages")
+                    if queue_ids_to_delete:
+                        deleted_postfix = db.query(PostfixLog).filter(
+                            PostfixLog.queue_id.in_(queue_ids_to_delete)
+                        ).delete(synchronize_session=False)
+                        
+                        if deleted_postfix > 0:
+                            logger.info(f"[BLACKLIST] Deleted {deleted_postfix} Postfix logs linked to blacklisted messages")
+                    
+                    if deleted_corr > 0:
+                        logger.info(f"[BLACKLIST] Deleted {deleted_corr} correlations for blacklisted message IDs")
                 
-                if deleted_corr > 0:
-                    logger.info(f"[BLACKLIST] Deleted {deleted_corr} correlations for blacklisted message IDs")
+                db.commit()
             
-            db.commit()
+            total_new += page_new
+            total_skipped += page_skipped
+            total_blacklisted += page_blacklisted
             
-            if new_count > 0:
-                msg = f"[OK] Imported {new_count} Rspamd logs"
-                if skipped_blacklist > 0:
-                    msg += f" (skipped {skipped_blacklist} blacklisted)"
-                logger.info(msg)
+            pct = round(page_num / pages_to_fetch * 100)
+            if page_new > 0:
+                logger.info(f"[RSPAMD] Page {page_num}/{pages_to_fetch} ({pct}%): imported {page_new} new, skipped {page_skipped} duplicates")
             
-            if len(seen_rspamd) > 10000:
-                seen_rspamd.clear()
+            # Early stop: no new imports means we've caught up (duplicates + blacklisted = processed)
+            if page_new == 0:
+                logger.info(f"[RSPAMD] Page {page_num}/{pages_to_fetch}: all duplicates/blacklisted, caught up — stopping early")
+                _resume_offset['rspamd'] = 0
+                break
+            
+            offset += len(logs)
+        
+        else:
+            # Loop completed without break
+            if pages_to_fetch < total_pages_needed:
+                _resume_offset['rspamd'] = offset + page_size
+                logger.info(f"[RSPAMD] Completed {pages_to_fetch}/{total_pages_needed} pages, will resume from offset {_resume_offset['rspamd']} next cycle")
+            else:
+                _resume_offset['rspamd'] = 0
+        
+        if total_new > 0:
+            msg = f"[OK] Imported {total_new} Rspamd logs across {page_num} page(s)"
+            if total_skipped > 0:
+                msg += f" (skipped {total_skipped} duplicates)"
+            if total_blacklisted > 0:
+                msg += f" (skipped {total_blacklisted} blacklisted)"
+            logger.info(msg)
+        
+        if len(seen_rspamd) > 10000:
+            seen_rspamd.clear()
     
     except Exception as e:
         logger.error(f"[ERROR] Rspamd fetch error: {e}")
+
 
 
 def parse_netfilter_message(message: str, priority: Optional[str] = None) -> Dict[str, Any]:
@@ -634,6 +897,8 @@ def parse_netfilter_message(message: str, priority: Optional[str] = None) -> Dic
 
 async def fetch_and_store_netfilter():
     """Fetch Netfilter logs from API and store in DB"""
+    if not settings.is_feature_enabled('netfilter'):
+        return
     last_fetch_run_time['netfilter'] = datetime.now(timezone.utc)
     
     try:
@@ -726,17 +991,22 @@ async def fetch_all_logs():
         update_job_status('fetch_logs', 'running')
         logger.debug("[FETCH] Starting fetch_all_logs")
         
-        results = await asyncio.gather(
+        tasks = [
             fetch_and_store_postfix(),
             fetch_and_store_rspamd(),
-            fetch_and_store_netfilter(),
-            return_exceptions=True
-        )
+        ]
+        if settings.is_feature_enabled('netfilter'):
+            tasks.append(fetch_and_store_netfilter())
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        log_types = ["Postfix", "Rspamd"]
+        if settings.is_feature_enabled('netfilter'):
+            log_types.append("Netfilter")
         
         for i, result in enumerate(results):
             if isinstance(result, Exception):
-                log_type = ["Postfix", "Rspamd", "Netfilter"][i]
-                logger.error(f"[ERROR] {log_type} fetch failed: {result}", exc_info=result)
+                logger.error(f"[ERROR] {log_types[i]} fetch failed: {result}", exc_info=result)
         
         logger.debug("[FETCH] Completed fetch_all_logs")
         update_job_status('fetch_logs', 'success')
@@ -1333,6 +1603,9 @@ async def check_monitored_hosts_job(force: bool = False, send_notification: bool
         force: If True, bypass cache and force fresh check
         send_notification: If True, send email on failure. Defaults to True.
     """
+    if not settings.is_feature_enabled('blacklist'):
+        logger.debug("[BLACKLIST] Feature disabled, skipping")
+        return
     global _blacklist_last_listed_actionable_count
     update_job_status('blacklist_check', 'running')
     
@@ -1641,6 +1914,9 @@ async def dmarc_imap_sync_job():
     Scheduled job to sync DMARC reports from IMAP mailbox
     Runs every hour (configurable via DMARC_IMAP_INTERVAL)
     """
+    if not settings.is_feature_enabled('dmarc'):
+        logger.debug("[DMARC] Feature disabled, skipping IMAP sync")
+        return
     if not settings.dmarc_imap_enabled:
         logger.debug("DMARC IMAP sync is disabled, skipping")
         return
@@ -1745,6 +2021,9 @@ async def cleanup_old_logs():
 
 async def cleanup_old_dmarc_reports():
     """Delete DMARC and TLS reports older than DMARC_RETENTION_DAYS"""
+    if not settings.is_feature_enabled('dmarc'):
+        logger.debug("[DMARC] Feature disabled, skipping report cleanup")
+        return
     update_job_status('cleanup_dmarc_reports', 'running')
     try:
         with get_db_context() as db:
@@ -1900,6 +2179,9 @@ def cleanup_blacklisted_data():
 
 async def check_all_domains_dns_background():
     """Background job to check DNS for all domains"""
+    if not settings.is_feature_enabled('domains'):
+        logger.debug("[DNS] Domains feature disabled, skipping DNS check")
+        return
     logger.info("Starting background DNS check...")
     update_job_status('dns_check', 'running')
     try:
@@ -2018,6 +2300,9 @@ async def update_mailbox_statistics():
     Runs every 5 minutes.
     Also removes mailboxes that no longer exist in mailcow.
     """
+    if not settings.is_feature_enabled('mailbox-stats'):
+        logger.debug("[MAILBOX] Feature disabled, skipping mailbox statistics")
+        return
     update_job_status('mailbox_stats', 'running')
     logger.info("Starting mailbox statistics update...")
     
@@ -2140,6 +2425,9 @@ async def update_alias_statistics():
     Runs every 5 minutes.
     Also removes aliases that no longer exist in mailcow.
     """
+    if not settings.is_feature_enabled('mailbox-stats'):
+        logger.debug("[ALIAS] Feature disabled, skipping alias statistics")
+        return
     update_job_status('alias_stats', 'running')
     logger.info("Starting alias statistics update...")
     
@@ -2246,6 +2534,9 @@ async def sync_transports_job():
     Sync transports and relayhosts from mailcow to MonitoredHost table.
     Runs every 6 hours.
     """
+    if not settings.is_feature_enabled('domains'):
+        logger.debug("[TRANSPORTS] Domains feature disabled, skipping transport sync")
+        return
     update_job_status('sync_transports', 'running')
     try:
         if not settings.mailcow_api_key or not settings.mailcow_url:
@@ -2522,6 +2813,8 @@ async def cleanup_deferred_queue_job():
       2. Suppress the recipient(s) using suppression_base_expiry_days
     Completely stateless — only looks at arrival_time vs now.
     """
+    if not settings.is_feature_enabled('spam-filter'):
+        return
     if not settings.suppression_enabled or not settings.queue_cleanup_enabled:
         return
     if not mailcow_api.has_rw_key:
@@ -2733,13 +3026,16 @@ def start_scheduler():
         )
 
         # Job 6b: Cleanup old DMARC/TLS reports (daily at 2:15 AM)
-        scheduler.add_job(
-            cleanup_old_dmarc_reports,
-            trigger=CronTrigger(hour=2, minute=15),
-            id='cleanup_dmarc_reports',
-            name='Cleanup Old DMARC Reports',
-            replace_existing=True
-        )
+        if settings.is_feature_enabled('dmarc'):
+            scheduler.add_job(
+                cleanup_old_dmarc_reports,
+                trigger=CronTrigger(hour=2, minute=15),
+                id='cleanup_dmarc_reports',
+                name='Cleanup Old DMARC Reports',
+                replace_existing=True
+            )
+        else:
+            logger.info("   [FEATURE] DMARC feature disabled — skipping DMARC cleanup job")
         
         # Job 7: Check app version updates (every 6 hours, starting immediately)
         scheduler.add_job(
@@ -2753,23 +3049,26 @@ def start_scheduler():
         )
         
         # Job 8: DNS Check
-        scheduler.add_job(
-            check_all_domains_dns_background,
-            trigger=IntervalTrigger(hours=6),
-            id='dns_check_background',
-            name='DNS Check (All Domains)',
-            replace_existing=True,
-            max_instances=1
-        )
-        
-        # Job 8b: Initial DNS check on startup
-        scheduler.add_job(
-            check_all_domains_dns_background,
-            'date',
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=60),
-            id='dns_check_startup',
-            name='DNS Check (Startup)'
-        )
+        if settings.is_feature_enabled('domains'):
+            scheduler.add_job(
+                check_all_domains_dns_background,
+                trigger=IntervalTrigger(hours=6),
+                id='dns_check_background',
+                name='DNS Check (All Domains)',
+                replace_existing=True,
+                max_instances=1
+            )
+            
+            # Job 8b: Initial DNS check on startup
+            scheduler.add_job(
+                check_all_domains_dns_background,
+                'date',
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=60),
+                id='dns_check_startup',
+                name='DNS Check (Startup)'
+            )
+        else:
+            logger.info("   [FEATURE] Domains feature disabled — skipping DNS check jobs")
 
         # Job 9: Sync local domains (every 6 hours)
         scheduler.add_job(
@@ -2806,7 +3105,7 @@ def start_scheduler():
             logger.info("   [GEOIP] MaxMind license key not configured, GeoIP features disabled")
 
         # Job 12: DMARC IMAP Sync - runs at configured interval (default: hourly)
-        if settings.dmarc_imap_enabled:
+        if settings.is_feature_enabled('dmarc') and settings.dmarc_imap_enabled:
             scheduler.add_job(
                 dmarc_imap_sync_job,
                 IntervalTrigger(seconds=settings.dmarc_imap_interval),
@@ -2817,7 +3116,7 @@ def start_scheduler():
             logger.info(f"Scheduled DMARC IMAP sync job (interval: {settings.dmarc_imap_interval}s)")
         
         # Run once on startup if configured
-        if settings.dmarc_imap_run_on_startup:
+        if settings.is_feature_enabled('dmarc') and settings.dmarc_imap_run_on_startup:
             scheduler.add_job(
                 dmarc_imap_sync_job,
                 'date',
@@ -2828,84 +3127,89 @@ def start_scheduler():
             logger.info("Scheduled initial DMARC IMAP sync on startup")
 
         # Job 13: Mailbox Statistics (every 5 minutes)
-        scheduler.add_job(
-            update_mailbox_statistics,
-            IntervalTrigger(minutes=5),
-            id='mailbox_stats',
-            name='Update Mailbox Statistics',
-            replace_existing=True,
-            max_instances=1
-        )
-        
-        # Run once on startup (after 45 seconds)
-        scheduler.add_job(
-            update_mailbox_statistics,
-            'date',
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=45),
-            id='mailbox_stats_startup',
-            name='Mailbox Statistics (Startup)'
-        )
-        logger.info("Scheduled mailbox statistics job (interval: 5 minutes)")
+        if settings.is_feature_enabled('mailbox-stats'):
+            scheduler.add_job(
+                update_mailbox_statistics,
+                IntervalTrigger(minutes=5),
+                id='mailbox_stats',
+                name='Update Mailbox Statistics',
+                replace_existing=True,
+                max_instances=1
+            )
+            
+            # Run once on startup (after 45 seconds)
+            scheduler.add_job(
+                update_mailbox_statistics,
+                'date',
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=45),
+                id='mailbox_stats_startup',
+                name='Mailbox Statistics (Startup)'
+            )
+            logger.info("Scheduled mailbox statistics job (interval: 5 minutes)")
 
-        # Job 14: Alias Statistics (every 5 minutes)
-        scheduler.add_job(
-            update_alias_statistics,
-            IntervalTrigger(minutes=5),
-            id='alias_stats',
-            name='Update Alias Statistics',
-            replace_existing=True,
-            max_instances=1
-        )
-        
-        # Run once on startup (after 50 seconds)
-        scheduler.add_job(
-            update_alias_statistics,
-            'date',
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=50),
-            id='alias_stats_startup',
-            name='Alias Statistics (Startup)'
-        )
-        logger.info("Scheduled alias statistics job (interval: 5 minutes)")
+            # Job 14: Alias Statistics (every 5 minutes)
+            scheduler.add_job(
+                update_alias_statistics,
+                IntervalTrigger(minutes=5),
+                id='alias_stats',
+                name='Update Alias Statistics',
+                replace_existing=True,
+                max_instances=1
+            )
+            
+            # Run once on startup (after 50 seconds)
+            scheduler.add_job(
+                update_alias_statistics,
+                'date',
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=50),
+                id='alias_stats_startup',
+                name='Alias Statistics (Startup)'
+            )
+            logger.info("Scheduled alias statistics job (interval: 5 minutes)")
+        else:
+            logger.info("   [FEATURE] Mailbox Stats feature disabled — skipping mailbox/alias stats jobs")
 
         # Job 15: Blacklist Check (daily at 5 AM)
-        # Job 15: Blacklist Check (daily at 5 AM)
-        scheduler.add_job(
-            check_monitored_hosts_job,
-            trigger=CronTrigger(hour=5, minute=0),
-            id='blacklist_check',
-            name='IP Blacklist Check (Daily)',
-            replace_existing=True,
-            max_instances=1
-        )
-        
-        # Run check on startup (after 15 seconds)
-        # This checks cache age (24h) internally, so it efficiently fulfills "check if >24h old"
-        scheduler.add_job(
-            check_monitored_hosts_job,
-            'date',
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=15),
-            id='blacklist_check_startup',
-            name='IP Blacklist Check (Startup)'
-        )
+        if settings.is_feature_enabled('blacklist'):
+            scheduler.add_job(
+                check_monitored_hosts_job,
+                trigger=CronTrigger(hour=5, minute=0),
+                id='blacklist_check',
+                name='IP Blacklist Check (Daily)',
+                replace_existing=True,
+                max_instances=1
+            )
+            
+            # Run check on startup (after 15 seconds)
+            scheduler.add_job(
+                check_monitored_hosts_job,
+                'date',
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=15),
+                id='blacklist_check_startup',
+                name='IP Blacklist Check (Startup)'
+            )
+        else:
+            logger.info("   [FEATURE] IP Blacklist feature disabled — skipping blacklist check jobs")
 
 
         # Job 14: Sync Transports (every 6 hours)
-        scheduler.add_job(
-            sync_transports_job,
-            trigger=IntervalTrigger(hours=6),
-            id='sync_transports',
-            name='Sync Transports & Relayhosts',
-            replace_existing=True
-        )
+        if settings.is_feature_enabled('domains'):
+            scheduler.add_job(
+                sync_transports_job,
+                trigger=IntervalTrigger(hours=6),
+                id='sync_transports',
+                name='Sync Transports & Relayhosts',
+                replace_existing=True
+            )
 
-        # Run sync on startup (after 30 seconds)
-        scheduler.add_job(
-            sync_transports_job,
-            'date',
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=30),
-            id='sync_transports_startup',
-            name='Sync Transports & Relayhosts (Startup)'
-        )
+            # Run sync on startup (after 30 seconds)
+            scheduler.add_job(
+                sync_transports_job,
+                'date',
+                run_date=datetime.now(timezone.utc) + timedelta(seconds=30),
+                id='sync_transports_startup',
+                name='Sync Transports & Relayhosts (Startup)'
+            )
 
         # Job 15: Weekly Summary Email (Every Monday at 9:00 AM)
         scheduler.add_job(
@@ -2917,7 +3221,7 @@ def start_scheduler():
         )
 
         # Job 16: Spam Suppression (if enabled)
-        if settings.suppression_enabled:
+        if settings.is_feature_enabled('spam-filter') and settings.suppression_enabled:
             # Detect bounces from postfix logs every 5 minutes
             scheduler.add_job(
                 detect_suppressions_job,
@@ -2967,7 +3271,7 @@ def start_scheduler():
                 logger.info(f"   [SPAM] Deferred queue cleanup: every 5 minutes (threshold: {settings.queue_cleanup_threshold_minutes}m)")
 
         # Quarantine Auto-Rules
-        if mailcow_api.has_rw_key:
+        if settings.is_feature_enabled('quarantine') and mailcow_api.has_rw_key:
             scheduler.add_job(
                 process_quarantine_rules_job,
                 trigger=IntervalTrigger(minutes=settings.quarantine_rules_interval),
@@ -3023,6 +3327,8 @@ async def detect_suppressions_job():
     Scan recent postfix logs for bounced/rejected outbound emails
     and add them to the suppression list.
     """
+    if not settings.is_feature_enabled('spam-filter'):
+        return
     if not settings.suppression_enabled or not settings.suppression_auto_detect:
         return
     
@@ -3030,8 +3336,10 @@ async def detect_suppressions_job():
     
     try:
         with get_db_context() as db:
-            # Look for recent bounced outbound emails (last 10 minutes)
-            cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+            # Look for recently imported bounced emails (last 10 minutes by import time)
+            # Uses created_at (DB insert time) instead of time (original mailcow timestamp)
+            # so that historical bounces imported via paginated fetch are still detected
+            cutoff = datetime.utcnow() - timedelta(minutes=10)
             
             # When queue_cleanup_enabled, soft bounces are handled by
             # cleanup_deferred_queue_job (checks the live queue directly).
@@ -3041,14 +3349,10 @@ async def detect_suppressions_job():
                 statuses_to_check.append('deferred')
             
             bounce_logs = db.query(PostfixLog).filter(
-                PostfixLog.time >= cutoff,
+                PostfixLog.created_at >= cutoff,
                 PostfixLog.status.in_(statuses_to_check),
                 PostfixLog.recipient.isnot(None),
                 PostfixLog.dsn.isnot(None),
-                # Only real outbound messages — skip bounce notifications (DSNs)
-                # DSNs have an empty sender or MAILER-DAEMON
-                PostfixLog.sender.isnot(None),
-                PostfixLog.sender != '',
             ).all()
             
             if not bounce_logs:
@@ -3061,10 +3365,13 @@ async def detect_suppressions_job():
             emails_for_queue_cleanup = []  # Only hard bounces — deferred/soft should be retried by Postfix
             
             for log in bounce_logs:
-                # Skip bounce notification (DSN) entries — their sender is MAILER-DAEMON
-                sender = (log.sender or '').lower().strip()
-                if not sender or sender.startswith('mailer-daemon'):
-                    continue
+                # Skip DSN bounce notifications:
+                # - Regular bounce lines have NO from= field → sender is None → process normally
+                # - DSN messages have from=<> (empty) or from=<MAILER-DAEMON> → skip
+                if log.sender is not None:
+                    sender_val = log.sender.lower().strip()
+                    if not sender_val or sender_val.startswith('mailer-daemon'):
+                        continue
                 
                 recipient = log.recipient.lower().strip()
                 
@@ -3204,6 +3511,8 @@ async def sync_suppressions_to_rspamd_job():
     Sync active suppressions to Rspamd's global_rcpt_blacklist.map
     using the shared sync function from the suppressions router.
     """
+    if not settings.is_feature_enabled('spam-filter'):
+        return
     if not settings.suppression_enabled or not settings.suppression_rspamd_sync:
         return
     if not settings.is_rspamd_configured or not settings.mailcow_api_key_rw:
@@ -3227,6 +3536,8 @@ async def expire_suppressions_job():
     """
     Deactivate suppressions that have passed their expiry date.
     """
+    if not settings.is_feature_enabled('spam-filter'):
+        return
     if not settings.suppression_enabled:
         return
     
@@ -3266,6 +3577,8 @@ async def process_quarantine_rules_job():
     4. Log each action to QuarantineRuleLog
     5. Clean up old logs based on retention setting
     """
+    if not settings.is_feature_enabled('quarantine'):
+        return
     from .models import QuarantineRule, QuarantineRuleLog
     from .routers.quarantine_rules import _find_matching_rule
     import re

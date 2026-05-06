@@ -297,6 +297,7 @@ async def app_info():
         "auth_enabled": settings.is_authentication_enabled,
         "basic_auth_enabled": settings.is_basic_auth_enabled,
         "oauth2_enabled": settings.is_oauth2_enabled,
+        "disabled_features": sorted(settings.disabled_features_set),
     }
 
 

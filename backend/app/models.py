@@ -6,7 +6,7 @@ SIMPLIFIED VERSION:
 - Removed old generate_correlation_key function
 - Correlation key is now SHA256 of Message-ID
 """
-from sqlalchemy import Column, Integer, BigInteger, String, Float, DateTime, Boolean, Text, Index, JSON, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, String, Float, DateTime, Boolean, Text, Index, JSON, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 
@@ -179,6 +179,9 @@ class MessageCorrelation(Base):
         Index('idx_correlation_message_id', 'message_id'),
         Index('idx_correlation_queue_id', 'queue_id'),
         Index('idx_correlation_sender_recipient', 'sender', 'recipient'),
+        # Functional indexes for case-insensitive mailbox stats queries
+        Index('idx_correlation_sender_lower', func.lower(sender)),
+        Index('idx_correlation_recipient_lower', func.lower(recipient)),
     )
     
     def __repr__(self):

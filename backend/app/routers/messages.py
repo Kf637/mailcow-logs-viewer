@@ -213,7 +213,7 @@ async def get_unified_messages(
         
         # Apply pagination
         offset = (page - 1) * limit
-        messages = query.order_by(desc(MessageCorrelation.last_seen)).offset(offset).limit(limit * 2).all()
+        messages = query.order_by(desc(MessageCorrelation.first_seen)).offset(offset).limit(limit * 2).all()
         
         # Filter out blacklisted emails and build response
         result_messages = []

@@ -173,6 +173,7 @@ async def get_settings_info(db: Session = Depends(get_db)):
                 "fetch_count_postfix": settings.fetch_count_postfix,
                 "fetch_count_rspamd": settings.fetch_count_rspamd,
                 "fetch_count_netfilter": settings.fetch_count_netfilter,
+                "fetch_max_pages": settings.fetch_max_pages,
                 "retention_days": settings.retention_days,
                 "max_correlation_age_minutes": settings.max_correlation_age_minutes,
                 "correlation_check_interval": settings.correlation_check_interval,
@@ -261,12 +262,13 @@ async def get_settings_info(db: Session = Depends(get_db)):
                     "error": jobs_status.get('cleanup_logs', {}).get('error')
                 },
                 "cleanup_dmarc_reports": {
-                    "schedule": "Daily at 2:15 AM",
+                    "schedule": "Daily at 2:15 AM" if settings.is_feature_enabled('dmarc') else "Disabled (feature off)",
                     "description": "Removes old DMARC and TLS reports based on DMARC retention period",
                     "retention": f"{settings.dmarc_retention_days} days",
-                    "status": jobs_status.get('cleanup_dmarc_reports', {}).get('status', 'unknown'),
-                    "last_run": format_datetime_utc(jobs_status.get('cleanup_dmarc_reports', {}).get('last_run')),
-                    "error": jobs_status.get('cleanup_dmarc_reports', {}).get('error')
+                    "feature_disabled": not settings.is_feature_enabled('dmarc'),
+                    "status": jobs_status.get('cleanup_dmarc_reports', {}).get('status', 'unknown') if settings.is_feature_enabled('dmarc') else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('cleanup_dmarc_reports', {}).get('last_run')) if settings.is_feature_enabled('dmarc') else None,
+                    "error": jobs_status.get('cleanup_dmarc_reports', {}).get('error') if settings.is_feature_enabled('dmarc') else None
                 },
                 "check_app_version": {
                     "interval": "6 hours",
@@ -276,11 +278,12 @@ async def get_settings_info(db: Session = Depends(get_db)):
                     "error": jobs_status.get('check_app_version', {}).get('error')
                 },
                 "dns_check": {
-                    "interval": "6 hours",
+                    "interval": "6 hours" if settings.is_feature_enabled('domains') else "Disabled (feature off)",
                     "description": "Validates DNS records (SPF, DKIM, DMARC) for all active domains",
-                    "status": jobs_status.get('dns_check', {}).get('status', 'unknown'),
-                    "last_run": format_datetime_utc(jobs_status.get('dns_check', {}).get('last_run')),
-                    "error": jobs_status.get('dns_check', {}).get('error')
+                    "feature_disabled": not settings.is_feature_enabled('domains'),
+                    "status": jobs_status.get('dns_check', {}).get('status', 'unknown') if settings.is_feature_enabled('domains') else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('dns_check', {}).get('last_run')) if settings.is_feature_enabled('domains') else None,
+                    "error": jobs_status.get('dns_check', {}).get('error') if settings.is_feature_enabled('domains') else None
                 },
                 "sync_local_domains": {
                     "interval": "6 hours",
@@ -290,12 +293,13 @@ async def get_settings_info(db: Session = Depends(get_db)):
                     "error": jobs_status.get('sync_local_domains', {}).get('error')
                 },
                 "dmarc_imap_sync": {
-                    "interval": f"{settings.dmarc_imap_interval} seconds ({settings.dmarc_imap_interval // 60} minutes)" if settings.dmarc_imap_enabled else "Disabled",
+                    "interval": f"{settings.dmarc_imap_interval} seconds ({settings.dmarc_imap_interval // 60} minutes)" if (settings.is_feature_enabled('dmarc') and settings.dmarc_imap_enabled) else ("Disabled (feature off)" if not settings.is_feature_enabled('dmarc') else "Disabled"),
                     "description": "Imports DMARC reports from IMAP mailbox",
-                    "enabled": settings.dmarc_imap_enabled,
-                    "status": jobs_status.get('dmarc_imap_sync', {}).get('status', 'idle') if settings.dmarc_imap_enabled else 'disabled',
-                    "last_run": format_datetime_utc(jobs_status.get('dmarc_imap_sync', {}).get('last_run')) if settings.dmarc_imap_enabled else None,
-                    "error": jobs_status.get('dmarc_imap_sync', {}).get('error') if settings.dmarc_imap_enabled else None
+                    "enabled": settings.is_feature_enabled('dmarc') and settings.dmarc_imap_enabled,
+                    "feature_disabled": not settings.is_feature_enabled('dmarc'),
+                    "status": jobs_status.get('dmarc_imap_sync', {}).get('status', 'idle') if (settings.is_feature_enabled('dmarc') and settings.dmarc_imap_enabled) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('dmarc_imap_sync', {}).get('last_run')) if (settings.is_feature_enabled('dmarc') and settings.dmarc_imap_enabled) else None,
+                    "error": jobs_status.get('dmarc_imap_sync', {}).get('error') if (settings.is_feature_enabled('dmarc') and settings.dmarc_imap_enabled) else None
                 },
                 "update_geoip": {
                     "schedule": "Weekly (Sunday 3 AM)" if is_license_configured() else "Disabled",
@@ -306,32 +310,36 @@ async def get_settings_info(db: Session = Depends(get_db)):
                     "error": jobs_status.get('update_geoip', {}).get('error') if is_license_configured() else None
                 },
                 "mailbox_stats": {
-                    "interval": "5 minutes",
+                    "interval": "5 minutes" if settings.is_feature_enabled('mailbox-stats') else "Disabled (feature off)",
                     "description": "Fetches mailbox statistics from mailcow API",
-                    "status": jobs_status.get('mailbox_stats', {}).get('status', 'unknown'),
-                    "last_run": format_datetime_utc(jobs_status.get('mailbox_stats', {}).get('last_run')),
-                    "error": jobs_status.get('mailbox_stats', {}).get('error')
+                    "feature_disabled": not settings.is_feature_enabled('mailbox-stats'),
+                    "status": jobs_status.get('mailbox_stats', {}).get('status', 'unknown') if settings.is_feature_enabled('mailbox-stats') else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('mailbox_stats', {}).get('last_run')) if settings.is_feature_enabled('mailbox-stats') else None,
+                    "error": jobs_status.get('mailbox_stats', {}).get('error') if settings.is_feature_enabled('mailbox-stats') else None
                 },
                 "alias_stats": {
-                    "interval": "5 minutes",
+                    "interval": "5 minutes" if settings.is_feature_enabled('mailbox-stats') else "Disabled (feature off)",
                     "description": "Syncs alias data from mailcow API",
-                    "status": jobs_status.get('alias_stats', {}).get('status', 'unknown'),
-                    "last_run": format_datetime_utc(jobs_status.get('alias_stats', {}).get('last_run')),
-                    "error": jobs_status.get('alias_stats', {}).get('error')
+                    "feature_disabled": not settings.is_feature_enabled('mailbox-stats'),
+                    "status": jobs_status.get('alias_stats', {}).get('status', 'unknown') if settings.is_feature_enabled('mailbox-stats') else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('alias_stats', {}).get('last_run')) if settings.is_feature_enabled('mailbox-stats') else None,
+                    "error": jobs_status.get('alias_stats', {}).get('error') if settings.is_feature_enabled('mailbox-stats') else None
                 },
                 "blacklist_check": {
-                    "schedule": "Daily at 5 AM",
+                    "schedule": "Daily at 5 AM" if settings.is_feature_enabled('blacklist') else "Disabled (feature off)",
                     "description": "Checks monitored hosts against DNS blacklists",
-                    "status": jobs_status.get('blacklist_check', {}).get('status', 'unknown'),
-                    "last_run": format_datetime_utc(jobs_status.get('blacklist_check', {}).get('last_run')),
-                    "error": jobs_status.get('blacklist_check', {}).get('error')
+                    "feature_disabled": not settings.is_feature_enabled('blacklist'),
+                    "status": jobs_status.get('blacklist_check', {}).get('status', 'unknown') if settings.is_feature_enabled('blacklist') else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('blacklist_check', {}).get('last_run')) if settings.is_feature_enabled('blacklist') else None,
+                    "error": jobs_status.get('blacklist_check', {}).get('error') if settings.is_feature_enabled('blacklist') else None
                 },
                 "sync_transports": {
-                    "interval": "6 hours",
+                    "interval": "6 hours" if settings.is_feature_enabled('domains') else "Disabled (feature off)",
                     "description": "Sync Transports & Relayhosts from mailcow",
-                    "status": jobs_status.get('sync_transports', {}).get('status', 'unknown'),
-                    "last_run": format_datetime_utc(jobs_status.get('sync_transports', {}).get('last_run')),
-                    "error": jobs_status.get('sync_transports', {}).get('error')
+                    "feature_disabled": not settings.is_feature_enabled('domains'),
+                    "status": jobs_status.get('sync_transports', {}).get('status', 'unknown') if settings.is_feature_enabled('domains') else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('sync_transports', {}).get('last_run')) if settings.is_feature_enabled('domains') else None,
+                    "error": jobs_status.get('sync_transports', {}).get('error') if settings.is_feature_enabled('domains') else None
                 },
                 "send_weekly_summary": {
                     "schedule": "Monday at 9:00 AM" if settings.enable_weekly_summary else "Disabled",
@@ -342,61 +350,68 @@ async def get_settings_info(db: Session = Depends(get_db)):
                     "error": jobs_status.get('send_weekly_summary', {}).get('error') if settings.enable_weekly_summary else None
                 },
                 "fetch_raw_logs": {
-                    "interval": f"{settings.raw_logs_fetch_interval} seconds" if settings.raw_logs_enabled else "Disabled",
+                    "interval": f"{settings.raw_logs_fetch_interval} seconds" if (settings.is_feature_enabled('logs') and settings.raw_logs_enabled) else ("Disabled (feature off)" if not settings.is_feature_enabled('logs') else "Disabled"),
                     "description": "Fetches raw logs from mailcow services for the Logs page",
-                    "enabled": settings.raw_logs_enabled,
-                    "status": _get_raw_logs_job_status('fetch_raw_logs', 'status', settings.raw_logs_enabled),
-                    "last_run": _get_raw_logs_job_status('fetch_raw_logs', 'last_run', settings.raw_logs_enabled),
-                    "error": _get_raw_logs_job_status('fetch_raw_logs', 'error', settings.raw_logs_enabled)
+                    "enabled": settings.is_feature_enabled('logs') and settings.raw_logs_enabled,
+                    "feature_disabled": not settings.is_feature_enabled('logs'),
+                    "status": _get_raw_logs_job_status('fetch_raw_logs', 'status', settings.is_feature_enabled('logs') and settings.raw_logs_enabled),
+                    "last_run": _get_raw_logs_job_status('fetch_raw_logs', 'last_run', settings.is_feature_enabled('logs') and settings.raw_logs_enabled),
+                    "error": _get_raw_logs_job_status('fetch_raw_logs', 'error', settings.is_feature_enabled('logs') and settings.raw_logs_enabled)
                 },
                 "cleanup_raw_logs": {
-                    "schedule": "Daily at 3:00 AM" if settings.raw_logs_enabled else "Disabled",
+                    "schedule": "Daily at 3:00 AM" if (settings.is_feature_enabled('logs') and settings.raw_logs_enabled) else ("Disabled (feature off)" if not settings.is_feature_enabled('logs') else "Disabled"),
                     "description": "Removes raw logs older than retention period",
-                    "retention": f"{settings.raw_logs_retention_days} days" if settings.raw_logs_enabled else None,
-                    "enabled": settings.raw_logs_enabled,
-                    "status": _get_raw_logs_job_status('cleanup_raw_logs', 'status', settings.raw_logs_enabled),
-                    "last_run": _get_raw_logs_job_status('cleanup_raw_logs', 'last_run', settings.raw_logs_enabled),
-                    "error": _get_raw_logs_job_status('cleanup_raw_logs', 'error', settings.raw_logs_enabled)
+                    "retention": f"{settings.raw_logs_retention_days} days" if (settings.is_feature_enabled('logs') and settings.raw_logs_enabled) else None,
+                    "enabled": settings.is_feature_enabled('logs') and settings.raw_logs_enabled,
+                    "feature_disabled": not settings.is_feature_enabled('logs'),
+                    "status": _get_raw_logs_job_status('cleanup_raw_logs', 'status', settings.is_feature_enabled('logs') and settings.raw_logs_enabled),
+                    "last_run": _get_raw_logs_job_status('cleanup_raw_logs', 'last_run', settings.is_feature_enabled('logs') and settings.raw_logs_enabled),
+                    "error": _get_raw_logs_job_status('cleanup_raw_logs', 'error', settings.is_feature_enabled('logs') and settings.raw_logs_enabled)
                 },
                 "detect_suppressions": {
-                    "interval": "5 minutes" if settings.suppression_enabled else "Disabled",
+                    "interval": "5 minutes" if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else ("Disabled (feature off)" if not settings.is_feature_enabled('spam-filter') else "Disabled (suppression off)"),
                     "description": "Scans Postfix logs for bounces to auto-suppress recipients",
-                    "enabled": settings.suppression_enabled and settings.suppression_auto_detect,
-                    "status": jobs_status.get('detect_suppressions', {}).get('status', 'idle') if settings.suppression_enabled else 'disabled',
-                    "last_run": format_datetime_utc(jobs_status.get('detect_suppressions', {}).get('last_run')) if settings.suppression_enabled else None,
-                    "error": jobs_status.get('detect_suppressions', {}).get('error') if settings.suppression_enabled else None
+                    "enabled": settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.suppression_auto_detect,
+                    "feature_disabled": not settings.is_feature_enabled('spam-filter'),
+                    "status": jobs_status.get('detect_suppressions', {}).get('status', 'idle') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('detect_suppressions', {}).get('last_run')) if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else None,
+                    "error": jobs_status.get('detect_suppressions', {}).get('error') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else None
                 },
                 "sync_suppressions": {
-                    "interval": "10 minutes" if (settings.suppression_enabled and settings.suppression_rspamd_sync) else "Disabled",
+                    "interval": "10 minutes" if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.suppression_rspamd_sync) else ("Disabled (feature off)" if not settings.is_feature_enabled('spam-filter') else ("Disabled (suppression off)" if not settings.suppression_enabled else "Disabled (Rspamd sync off)")),
                     "description": "Syncs active suppressions to Rspamd recipient denylist",
-                    "enabled": settings.suppression_enabled and settings.suppression_rspamd_sync and settings.is_rspamd_configured,
-                    "status": jobs_status.get('sync_suppressions', {}).get('status', 'idle') if (settings.suppression_enabled and settings.suppression_rspamd_sync) else 'disabled',
-                    "last_run": format_datetime_utc(jobs_status.get('sync_suppressions', {}).get('last_run')) if (settings.suppression_enabled and settings.suppression_rspamd_sync) else None,
-                    "error": jobs_status.get('sync_suppressions', {}).get('error') if (settings.suppression_enabled and settings.suppression_rspamd_sync) else None
+                    "enabled": settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.suppression_rspamd_sync and settings.is_rspamd_configured,
+                    "feature_disabled": not settings.is_feature_enabled('spam-filter'),
+                    "status": jobs_status.get('sync_suppressions', {}).get('status', 'idle') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.suppression_rspamd_sync) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('sync_suppressions', {}).get('last_run')) if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.suppression_rspamd_sync) else None,
+                    "error": jobs_status.get('sync_suppressions', {}).get('error') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.suppression_rspamd_sync) else None
                 },
                 "expire_suppressions": {
-                    "interval": "1 hour" if settings.suppression_enabled else "Disabled",
+                    "interval": "1 hour" if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else ("Disabled (feature off)" if not settings.is_feature_enabled('spam-filter') else "Disabled (suppression off)"),
                     "description": "Deactivates expired suppression entries",
-                    "enabled": settings.suppression_enabled,
-                    "status": jobs_status.get('expire_suppressions', {}).get('status', 'idle') if settings.suppression_enabled else 'disabled',
-                    "last_run": format_datetime_utc(jobs_status.get('expire_suppressions', {}).get('last_run')) if settings.suppression_enabled else None,
-                    "error": jobs_status.get('expire_suppressions', {}).get('error') if settings.suppression_enabled else None
+                    "enabled": settings.is_feature_enabled('spam-filter') and settings.suppression_enabled,
+                    "feature_disabled": not settings.is_feature_enabled('spam-filter'),
+                    "status": jobs_status.get('expire_suppressions', {}).get('status', 'idle') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('expire_suppressions', {}).get('last_run')) if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else None,
+                    "error": jobs_status.get('expire_suppressions', {}).get('error') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled) else None
                 },
                 "process_quarantine_rules": {
-                    "interval": f"{settings.quarantine_rules_interval} minutes" if mailcow_api.has_rw_key else "Disabled (no RW API key)",
+                    "interval": f"{settings.quarantine_rules_interval} minutes" if (settings.is_feature_enabled('quarantine') and mailcow_api.has_rw_key) else ("Disabled (feature off)" if not settings.is_feature_enabled('quarantine') else "Disabled (no RW API key)"),
                     "description": "Processes quarantine auto-rules (release/delete matching emails)",
-                    "enabled": mailcow_api.has_rw_key,
-                    "status": jobs_status.get('process_quarantine_rules', {}).get('status', 'idle') if mailcow_api.has_rw_key else 'disabled',
-                    "last_run": format_datetime_utc(jobs_status.get('process_quarantine_rules', {}).get('last_run')) if mailcow_api.has_rw_key else None,
-                    "error": jobs_status.get('process_quarantine_rules', {}).get('error') if mailcow_api.has_rw_key else None
+                    "enabled": settings.is_feature_enabled('quarantine') and mailcow_api.has_rw_key,
+                    "feature_disabled": not settings.is_feature_enabled('quarantine'),
+                    "status": jobs_status.get('process_quarantine_rules', {}).get('status', 'idle') if (settings.is_feature_enabled('quarantine') and mailcow_api.has_rw_key) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('process_quarantine_rules', {}).get('last_run')) if (settings.is_feature_enabled('quarantine') and mailcow_api.has_rw_key) else None,
+                    "error": jobs_status.get('process_quarantine_rules', {}).get('error') if (settings.is_feature_enabled('quarantine') and mailcow_api.has_rw_key) else None
                 },
                 "cleanup_deferred_queue": {
-                    "interval": "5 minutes" if (settings.suppression_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key) else "Disabled",
+                    "interval": "5 minutes" if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key) else ("Disabled (feature off)" if not settings.is_feature_enabled('spam-filter') else ("Disabled (suppression off)" if not settings.suppression_enabled else ("Disabled (queue cleanup off)" if not settings.queue_cleanup_enabled else "Disabled (no RW API key)"))),
                     "description": f"Deletes deferred emails stuck > {settings.queue_cleanup_threshold_minutes}m and suppresses recipients",
-                    "enabled": settings.suppression_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key,
-                    "status": jobs_status.get('cleanup_deferred_queue', {}).get('status', 'idle') if (settings.suppression_enabled and settings.queue_cleanup_enabled) else 'disabled',
-                    "last_run": format_datetime_utc(jobs_status.get('cleanup_deferred_queue', {}).get('last_run')) if (settings.suppression_enabled and settings.queue_cleanup_enabled) else None,
-                    "error": jobs_status.get('cleanup_deferred_queue', {}).get('error') if (settings.suppression_enabled and settings.queue_cleanup_enabled) else None
+                    "enabled": settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.queue_cleanup_enabled and mailcow_api.has_rw_key,
+                    "feature_disabled": not settings.is_feature_enabled('spam-filter'),
+                    "status": jobs_status.get('cleanup_deferred_queue', {}).get('status', 'idle') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.queue_cleanup_enabled) else 'disabled',
+                    "last_run": format_datetime_utc(jobs_status.get('cleanup_deferred_queue', {}).get('last_run')) if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.queue_cleanup_enabled) else None,
+                    "error": jobs_status.get('cleanup_deferred_queue', {}).get('error') if (settings.is_feature_enabled('spam-filter') and settings.suppression_enabled and settings.queue_cleanup_enabled) else None
                 }
             },
             "smtp_configuration": {
@@ -589,6 +604,59 @@ async def update_settings(body: Dict[str, Any], db: Session = Depends(get_db)):
     reschedule_interval_jobs()
     
     return {"settings_edit_via_ui_enabled": True, "settings_migrated": True, "configuration": _effective_config_for_editable(settings)}
+
+
+# Feature → tables mapping for data purge
+_FEATURE_TABLES = {
+    'netfilter': ['netfilter_logs'],
+    'domains': ['domain_dns_checks'],
+    'dmarc': ['dmarc_records', 'tls_report_policies', 'dmarc_reports', 'dmarc_syncs', 'tls_reports'],
+    'mailbox-stats': ['alias_statistics', 'mailbox_statistics'],
+    'logs': ['raw_service_logs'],
+    'blacklist': ['blacklist_checks', 'monitored_hosts'],
+    'spam-filter': ['spam_suppressions'],
+    'quarantine': ['quarantine_rule_logs', 'quarantine_rules'],
+}
+
+
+@router.post("/settings/purge-feature-data")
+async def purge_feature_data(body: Dict[str, Any], db: Session = Depends(get_db)):
+    """
+    Delete all database data associated with a disabled feature.
+    Body: { "feature": "<feature-id>" }
+    Only allowed when SETTINGS_EDIT_VIA_UI_ENABLED is true and the feature is currently disabled.
+    """
+    if not settings.edit_settings_via_ui_enabled:
+        raise HTTPException(status_code=403, detail="Editing settings from UI is disabled.")
+
+    feature = body.get("feature", "").strip().lower()
+    if feature not in _FEATURE_TABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown feature: {feature}")
+
+    if settings.is_feature_enabled(feature):
+        raise HTTPException(status_code=400, detail=f"Feature '{feature}' is currently enabled. Disable it first.")
+
+    tables = _FEATURE_TABLES[feature]
+    deleted_counts = {}
+    try:
+        for table_name in tables:
+            # Count rows first
+            count = db.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar() or 0
+            if count > 0:
+                db.execute(text(f"TRUNCATE TABLE {table_name} CASCADE"))
+            deleted_counts[table_name] = count
+        db.commit()
+        total = sum(deleted_counts.values())
+        logger.info(f"Purged data for feature '{feature}': {deleted_counts} (total {total} rows)")
+        return {
+            "feature": feature,
+            "tables_purged": deleted_counts,
+            "total_rows_deleted": total,
+        }
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Failed to purge data for feature '{feature}': {e}")
+        raise HTTPException(status_code=500, detail=f"Purge failed: {e}")
 
 
 @router.post("/settings/import-from-env")

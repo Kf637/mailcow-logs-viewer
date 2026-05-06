@@ -25,8 +25,10 @@ def is_geoip_available() -> bool:
     global _geoip_available
     
     if _geoip_available is None:
-        city_exists = Path(GEOIP_CITY_DB_PATH).exists()
-        asn_exists = Path(GEOIP_ASN_DB_PATH).exists()
+        city_path = Path(GEOIP_CITY_DB_PATH)
+        asn_path = Path(GEOIP_ASN_DB_PATH)
+        city_exists = city_path.exists() and city_path.stat().st_size > 0
+        asn_exists = asn_path.exists() and asn_path.stat().st_size > 0
         
         _geoip_available = city_exists
         
@@ -49,7 +51,8 @@ def get_city_reader():
     """Get or create GeoIP City database reader"""
     global _city_reader
     
-    if not Path(GEOIP_CITY_DB_PATH).exists():
+    city_path = Path(GEOIP_CITY_DB_PATH)
+    if not city_path.exists() or city_path.stat().st_size == 0:
         return None
     
     if _city_reader is None:
@@ -61,8 +64,9 @@ def get_city_reader():
             logger.error("geoip2 module not installed. Install with: pip install geoip2")
             _city_reader = None
         except Exception as e:
-            logger.error(f"Failed to load GeoIP City database: {e}")
+            logger.debug(f"GeoIP City database not usable (MaxMind not configured?): {e}")
             _city_reader = None
+            _geoip_available = False
     
     return _city_reader
 
@@ -71,7 +75,8 @@ def get_asn_reader():
     """Get or create GeoIP ASN database reader"""
     global _asn_reader
     
-    if not Path(GEOIP_ASN_DB_PATH).exists():
+    asn_path = Path(GEOIP_ASN_DB_PATH)
+    if not asn_path.exists() or asn_path.stat().st_size == 0:
         return None
     
     if _asn_reader is None:
@@ -83,7 +88,7 @@ def get_asn_reader():
             logger.error("geoip2 module not installed. Install with: pip install geoip2")
             _asn_reader = None
         except Exception as e:
-            logger.error(f"Failed to load GeoIP ASN database: {e}")
+            logger.debug(f"GeoIP ASN database not usable (MaxMind not configured?): {e}")
             _asn_reader = None
     
     return _asn_reader
