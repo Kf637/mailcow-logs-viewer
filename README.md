@@ -1,6 +1,6 @@
 # mailcow Logs Viewer
 
-A modern, self-hosted dashboard for viewing and analyzing mailcow mail server logs. Built for system administrators and technicians who need quick access to mail delivery status, spam analysis, and authentication failures.
+A modern, self-hosted dashboard for monitoring, analyzing, and managing your mailcow mail server. Track email delivery, investigate spam, manage quarantine, detect bounce-based abuse, and validate DNS configurations — all from a single interface.
 
 ![Main](images/Main.png)
 
@@ -21,88 +21,98 @@ A modern, self-hosted dashboard for viewing and analyzing mailcow mail server lo
 ## Features
 
 ### 📊 Dashboard
-- Real-time statistics (24h / 7d / 30d)
-- Messages, spam, failed deliveries, auth failures, internal emails counts
-- Container status overview
-- Storage usage with visual indicator
-- Quick search across all logs
-- Recent activity stream
+- Real-time statistics (24h / 7d / 30d) — messages, spam, bounces, auth failures
+- Container status overview and storage usage
+- Quick search across all logs and recent activity stream
 
 ### 📬 Messages
-- Unified view combining Postfix + Rspamd data
-- Smart correlation linking related logs
-- Multiple recipients display per email
-- Direction detection (Inbound/Outbound/Internal)
-- Internal email detection (local delivery with relay=dovecot)
-- Status tracking (delivered, bounced, deferred, expired, spam)
+- Unified view combining Postfix + Rspamd data with smart correlation
+- Direction detection (Inbound / Outbound / Internal)
+- Status tracking: delivered, bounced, deferred, expired, spam
 - Filter by sender, recipient, user, IP, direction
-- Result count display
-- CSV export
-- Smart auto-refresh (skips when searching/filtering)
+- CSV export, result count display, smart auto-refresh
 
-### 📋 Message Details Modal
-- **Overview tab**: Message summary with all recipients (includes addresses with `+` signs)
-- **Logs tab**: Complete Postfix delivery timeline with error summary and relay information
-- **Spam Analysis tab**: Full Rspamd symbols with scores and descriptions
-- **Security tab**: All Netfilter security events for sender's IP address (up to 100 most recent)
+### 📋 Message Details
+- **Overview**: Message summary with all recipients
+- **Logs**: Postfix delivery timeline with error summary and relay info
+- **Spam Analysis**: Full Rspamd symbols with scores and descriptions
+- **Security**: Netfilter events for the sender's IP
 
 ### 🔒 Security (Netfilter)
-- Failed authentication attempts
-- Card-based UI with IP, username, method, action
-- Attempt counts and timestamps
-- 🔴 Visual indicator in tab when 24h activity exists
-- Filter by IP, username, action
+- Failed authentication attempts with IP, username, method, and action
+- Security events chart — bans, unbans, and warnings per country
+- Fail2Ban management — ban/unban IPs directly (requires RW API key)
+- GeoIP enrichment with country flags and ASN info
+- Red indicator on tab when 24h activity exists
 
-### 📮 Queue & Quarantine
+### 📮 Queue
 - Real-time mail queue from mailcow API
-- Deferred messages with reasons
-- Quarantined emails
-- Search and filter
+- Deferred messages with failure reasons
+- **Suppress button** — quick-add any recipient to the suppression list
+- Bulk queue operations (delete items, requires RW API key)
 
-### 🌐 Domains Overview
-- Complete domains overview with DNS validation
-- SPF validation with DNS lookup counter and server IP authorization check
-- DKIM validation with mailcow configuration comparison
-- DMARC policy checking and recommendations
+### 🛡️ Quarantine
+- View quarantined emails with spam scores and quarantine reasons
+- **Release / Delete** individual or bulk items
+- **Auto-Rules** — automatically release or delete quarantine items based on matching rules
+  - Match by Sender, Sender Domain, Recipient, or Subject
+  - Exact Match, Contains, and Regex match modes
+  - Dry-run testing, action history log, safety limits
+  - Inline rule creation from any quarantine email (pre-filled)
+
+### 🚫 Spam Filter — Suppressions & Rspamd Maps
+- **Email Suppression List** — automatically block recipients that bounce
+  - Hard bounces (5.x.x) detected from Postfix logs
+  - Deferred queue cleanup — scans live queue for stuck emails and auto-cleans
+  - Progressive blocking with immediate Rspamd sync
+  - Manual management, import/export CSV, domain regex support
+- **Rspamd Maps Editor** — direct editor for all 13 Rspamd map files
+  - Built-in Regex Wizard for email, domain, TLD, and keyword patterns
+  - Pattern validation before saving
+
+### 🌐 Domains
+- DNS validation for SPF, DKIM, and DMARC with actionable recommendations
+- SPF: DNS lookup counter + server IP authorization check
+- DKIM: key validation with mailcow configuration comparison
+- DMARC: policy analysis with enforcement level recommendations
 - Automated DNS checks every 6 hours
 - Domain info: mailboxes, aliases, storage, relay settings
-- Color-coded status indicators (✓ green, ⚠ amber, ✗ red)
 
 ### 📊 Mailbox Statistics
-- Per-mailbox message statistics (sent, received, failed, failure rate)
-- Accordion-style mailbox list with expandable details
+- Per-mailbox message stats: sent, received, failed, failure rate
 - Per-alias statistics with message counts
 - Quota usage, login times, rate limits
-- Filtering by date range, domain, search, active only, hide zero activity
-- Sorting by sent, received, failure rate, quota, username
+- Sorting and filtering by date range, domain, activity
 
 ### 📧 DMARC Reports
-- DMARC report viewing and analysis
+- DMARC/SMTP-TLS report viewer with compliance analysis
 - GeoIP enrichment with MaxMind (City + ASN)
-- Daily aggregated reports with compliance rates
-- Manual upload (XML, GZ, ZIP formats)
-- IMAP auto-import with configurable sync interval
-- Sync history tracking with error notifications
+- Manual upload (XML, GZ, ZIP) and IMAP auto-import
+- Daily aggregation with sync history and error notifications
+
+### 📝 Logs (Raw Log Viewer)
+- Live log viewer for all mailcow services via WebSocket
+- 10 services: Postfix, Dovecot, Rspamd, SOGo, Netfilter, ACME, API, Autodiscover, Ratelimited, Watchdog
+- Real-time streaming with service filtering and search
+- Configurable fetch interval and retention
 
 ### 📈 Status
-- All container states (running/stopped count)
-- Storage usage with percentage bar
-- System info (domains, mailboxes, aliases)
-- Import status per log type
-- Background jobs status
+- Container states, storage usage, system info
+- Background jobs monitoring with status, intervals, and last run times
+- Manual job triggers (Run Now)
 - Correlation completion rate
-- Expired correlations counter
 
-### ⚙️ Additional
-- 🔐 Built-in Basic Authentication
-- 🌙 Dark mode
-- 📱 Responsive design
-- 🔄 Smart auto-refresh (respects user activity)
-- 📥 CSV export for all log types
-- 🚫 Email blacklist (hide specific addresses from display)
-- 🧹 Automatic old log cleanup
-- ⏰ Correlation expiration (marks old incomplete correlations)
-- 🔄 Background jobs for correlation status updates
+### ⚙️ Settings (Web UI)
+- **Full settings editor in the browser** — all configuration manageable via UI when enabled
+- Organized into tabs: General, Fetch, Alerts, DMARC, Blacklist, Logs, Spam Filter, Quarantine, Authentication
+- ENV variable override indicators (ENV always wins over DB)
+- Import settings from `.env` file, reset to defaults
+- GeoIP setup modal with download progress and health badges
+
+### 🔐 Authentication
+- **Basic Auth** — built-in HTTP Basic Authentication
+- **OAuth2/OIDC** — supports any standard provider (Mailcow, Keycloak, Auth0, Google, etc.)
+- Both methods can be enabled simultaneously
 
 ---
 
@@ -137,49 +147,30 @@ docker compose up -d
 
 ## Configuration
 
-All settings via environment variables. See **[env.example](env.example)** for full reference.
+All settings via environment variables or the **web UI** (when `SETTINGS_EDIT_VIA_UI_ENABLED=true`).
 
 ### Required Settings
 
 | Variable | Description |
 |----------|-------------|
 | `MAILCOW_URL` | mailcow instance URL |
-| `MAILCOW_API_KEY` | mailcow API key |
+| `MAILCOW_API_KEY` | mailcow Read-Only API key |
 | `POSTGRES_PASSWORD` | Database password |
 
 ### Key Optional Settings
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MAILCOW_API_KEY_RW` | (empty) | Read-Write API key — enables edit features (Fail2Ban, Queue, Quarantine, Rspamd sync) |
 | `FETCH_INTERVAL` | `60` | Seconds between log fetches |
-| `FETCH_COUNT_POSTFIX` | `2000` | Postfix records per fetch |
-| `FETCH_COUNT_RSPAMD` | `500` | Rspamd records per fetch |
 | `RETENTION_DAYS` | `7` | Days to keep logs |
-| `BLACKLIST_EMAILS` | (empty) | Emails to hide from display |
+| `RSPAMD_PASSWORD` | (empty) | Rspamd password — enables Spam Filter maps editor |
+| `SUPPRESSION_ENABLED` | `true` | Enable automatic email suppression |
+| `BASIC_AUTH_ENABLED` | `true` | Enable HTTP Basic Authentication |
+| `SETTINGS_EDIT_VIA_UI_ENABLED` | `true` | Allow managing settings from the web UI |
 | `TZ` | `UTC` | Timezone |
-| `AUTH_ENABLED` | `false` | Enable HTTP Basic Authentication |
-| `AUTH_USERNAME` | `admin` | Authentication username |
-| `AUTH_PASSWORD` | (empty) | Authentication password (required if enabled) |
 
----
-
-## API
-
-RESTful API for all functionality:
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/health` | Health check |
-| `GET /api/messages` | Unified messages with filters |
-| `GET /api/message/{key}/details` | Full message details |
-| `GET /api/logs/postfix` | Postfix logs |
-| `GET /api/logs/rspamd` | Rspamd logs |
-| `GET /api/logs/netfilter` | Netfilter logs |
-| `GET /api/stats/dashboard` | Dashboard statistics |
-| `GET /api/status/summary` | System status |
-| `GET /api/export/{type}/csv` | CSV export |
-
-📖 **Full API reference:** [API Documentation](documentation/API.md)
+📖 **Full reference:** [ENV Settings](documentation/ENV_Settings.md)
 
 ---
 
@@ -187,12 +178,13 @@ RESTful API for all functionality:
 
 | Document | Description |
 |----------|-------------|
-| [Getting Started](documentation/GETTING_STARTED.md) | Installation guide |
-| [API Documentation](documentation/API.md) | API reference |
+| [Getting Started](documentation/GETTING_STARTED.md) | Installation and setup guide |
+| [ENV Settings](documentation/ENV_Settings.md) | Complete environment variables reference |
+| [API Documentation](documentation/API.md) | REST API reference |
+| [Settings UI](documentation/Settings_UI.md) | Web-based settings editor guide |
+| [OAuth2 Configuration](documentation/OAuth2_Configuration.md) | OAuth2/OIDC setup guide |
+| [Upgrade to V2](documentation/UpdateV2.md) | Migration guide from V1 |
 | [Changelog](CHANGELOG.md) | Version history |
-| [env.example](env.example) | Configuration options |
-| [ENV Settings](documentation/ENV_SETTINGS.md) | Configuration options |
-| [Settings Editor](documentation/SETTINGS_EDITOR.md) | Settings editor |
 
 ---
 
@@ -204,52 +196,6 @@ RESTful API for all functionality:
 - 1GB disk (varies with retention)
 
 ---
-
-## Rate Limiting
-
-Currently, there is no rate limiting implemented. For production deployments, consider adding rate limiting via a reverse proxy (e.g., Traefik, Nginx).
-
----
-
-## Authentication
-
-The application supports built-in HTTP Basic Authentication to protect all pages and API endpoints.
-
-### Enabling Authentication
-
-Add the following to your `.env` file:
-
-```env
-AUTH_ENABLED=true
-AUTH_USERNAME=your_username
-AUTH_PASSWORD=your_secure_password
-```
-
-### How It Works
-
-- When authentication is enabled, all pages and API endpoints require valid credentials
-- Users are redirected to a dedicated login page (`/login`) if not authenticated
-- Credentials are stored in browser session storage (cleared when browser closes)
-- The main application page is only accessible after successful authentication
-- All API requests automatically include authentication headers
-
-### Security Notes
-
-- Use strong passwords in production
-- Credentials are transmitted using HTTP Basic Auth (Base64 encoded)
-- For production deployments over the internet, use HTTPS
-- Consider using a reverse proxy with additional security layers (rate limiting, IP whitelisting, etc.)
-
----
-
-## Notes
-
-1. **Timestamps**: All timestamps are returned in ISO 8601 format with UTC timezone (suffix `Z`)
-2. **Pagination**: Most list endpoints support `page` and `limit` parameters
-3. **Filtering**: Filters are applied server-side before pagination
-4. **Export Limits**: CSV exports are limited to `CSV_EXPORT_LIMIT` rows (default: 10,000)
-5. **Real-time Data**: Queue and Quarantine endpoints fetch data directly from mailcow API
-6. **Cached Data**: All other log data is stored in PostgreSQL and updated periodically
 
 ## License
 

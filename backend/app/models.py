@@ -6,7 +6,7 @@ SIMPLIFIED VERSION:
 - Removed old generate_correlation_key function
 - Correlation key is now SHA256 of Message-ID
 """
-from sqlalchemy import Column, Integer, BigInteger, String, Float, DateTime, Boolean, Text, Index, JSON, UniqueConstraint
+from sqlalchemy import Column, Integer, BigInteger, String, Float, DateTime, Boolean, Text, Index, JSON, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 
@@ -179,6 +179,9 @@ class MessageCorrelation(Base):
         Index('idx_correlation_message_id', 'message_id'),
         Index('idx_correlation_queue_id', 'queue_id'),
         Index('idx_correlation_sender_recipient', 'sender', 'recipient'),
+        # Functional indexes for case-insensitive mailbox stats queries
+        Index('idx_correlation_sender_lower', func.lower(sender)),
+        Index('idx_correlation_recipient_lower', func.lower(recipient)),
     )
     
     def __repr__(self):
@@ -577,3 +580,111 @@ class RawServiceLog(Base):
     
     def __repr__(self):
         return f"<RawServiceLog(service={self.service}, time={self.time})>"
+
+
+class SpamSuppression(Base):
+    """
+    Spam suppression list for blocking outgoing emails to recipients
+    that have previously bounced or been rejected.
+    
+    Uses progressive expiry: each subsequent bounce escalates the suppression
+    duration (base_days × bounce_count, capped at max_days).
+    
+    Synced to Rspamd's global_rcpt_blacklist.map via mailcow API.
+    """
+    __tablename__ = "spam_suppressions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    type = Column(String(20), index=True, default='email')            # 'email' or 'domain'
+    reason = Column(String(50), index=True, nullable=False)           # 'hard_bounce', 'soft_bounce', 'rejected', 'manual'
+    source = Column(String(100))                                      # 'auto', 'manual', 'import'
+    notes = Column(Text)
+    
+    # Progressive tracking
+    bounce_count = Column(Integer, default=1)                         # total escalation counter
+    hard_bounce_count = Column(Integer, default=0)                    # hard bounces specifically
+    soft_bounce_count = Column(Integer, default=0)                    # soft bounces specifically
+    last_bounce_dsn = Column(String(20))                              # e.g., '5.1.1', '4.2.2'
+    last_bounce_message = Column(Text)                                # DSN error message text
+    
+    # Linking to originating message
+    correlation_key = Column(String(64), nullable=True)
+    
+    # State
+    active = Column(Boolean, default=True, index=True)
+    synced_to_rspamd = Column(Boolean, default=False, index=True)
+    
+    # Expiry (NULL = never expires, for manual entries)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_suppression_email', 'email'),
+        Index('idx_suppression_active_sync', 'active', 'synced_to_rspamd'),
+        Index('idx_suppression_expires', 'active', 'expires_at'),
+    )
+    
+    def __repr__(self):
+        return f"<SpamSuppression(email={self.email}, reason={self.reason}, active={self.active}, bounces={self.bounce_count})>"
+
+
+class QuarantineRule(Base):
+    """
+    Quarantine auto-processing rules.
+    
+    Each rule matches quarantined emails by sender, domain, recipient, or subject
+    and automatically releases or deletes them.
+    Delete rules always take priority over release rules.
+    """
+    __tablename__ = "quarantine_rules"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    match_type = Column(String(20), nullable=False)         # 'sender', 'sender_domain', 'recipient', 'subject'
+    match_value = Column(String(500), nullable=False)       # plain text or regex pattern
+    is_regex = Column(Boolean, default=False)
+    action = Column(String(20), nullable=False)             # 'release' or 'delete'
+    enabled = Column(Boolean, default=True, index=True)
+    hit_count = Column(Integer, default=0)
+    last_hit_at = Column(DateTime, nullable=True)
+    notes = Column(Text)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    __table_args__ = (
+        Index('idx_qrule_enabled', 'enabled'),
+        Index('idx_qrule_action', 'action'),
+    )
+    
+    def __repr__(self):
+        return f"<QuarantineRule(name={self.name}, match={self.match_type}:{self.match_value}, action={self.action})>"
+
+
+class QuarantineRuleLog(Base):
+    """
+    History log of automatic quarantine actions taken by rules.
+    Tracks which rule matched, the action taken, and the email details.
+    """
+    __tablename__ = "quarantine_rule_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, index=True, nullable=False)
+    rule_name = Column(String(255))                         # snapshot of rule name at time of action
+    action = Column(String(20), nullable=False)             # 'release' or 'delete'
+    quarantine_id = Column(String(100))                     # mailcow quarantine item ID
+    sender = Column(String(255))
+    recipient = Column(String(255))
+    subject = Column(Text)
+    matched_field = Column(String(20))                      # which field matched
+    matched_value = Column(String(500))                     # the pattern that matched
+    
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    
+    __table_args__ = (
+        Index('idx_qrule_log_rule', 'rule_id'),
+        Index('idx_qrule_log_created', 'created_at'),
+    )

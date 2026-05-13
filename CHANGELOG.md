@@ -5,7 +5,187 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.4.0] - 2026-04-15
+## [2.6.0] - 2026-05-06
+
+### Added
+
+#### Dynamic Feature Toggles
+- **Enable or disable application features on-the-fly** from the Settings page without requiring a restart
+  - Toggle individual features: Security (Netfilter/Fail2Ban), Queue, Quarantine, Spam Filter, Domains, DMARC, Mailbox Statistics, Logs, Blacklist Monitor
+  - Page auto-reloads after toggling features so all UI changes take effect immediately
+
+#### Feature Toggle — UI Integration
+- **Navigation tabs** are dynamically hidden/shown based on enabled features
+- **Settings page**: Related settings tabs (DMARC, DMARC IMAP, Logs, Spam Filter, Quarantine) are hidden when their feature is disabled
+
+#### Feature Toggle — Background Job Guards
+- **Runtime feature checks** added to all feature-specific background jobs — disabling a feature immediately stops its related jobs without restart
+  - Previously, feature checks only occurred at startup (job registration). Now each job verifies its feature is still enabled at every execution
+
+#### Feature Toggle — Status Page
+- **"Feature Off" badge** on background job cards for disabled features
+
+#### Data Purge on Feature Disable
+- **Disabling a feature now purges all related data** from the database (with confirmation warning)
+
+#### Quarantine — Rspamd Training Actions
+- **Learn Not Spam**: Release a quarantined message and train Rspamd that it is not spam
+- **Learn Spam**: Delete a quarantined message and train Rspamd that it is spam
+
+#### Quarantine — Email Detail Modal
+- **Full email details view** — click "Details" or the subject line to open a modal with:
+  - Header info: Subject, From (Header), Envelope From, Recipients (with type badges), Score, Action
+  - Rspamd Symbols table sorted by absolute score impact; score-0 symbols in a collapsed accordion
+  - Email content preview (plain text or HTML body)
+
+### Changed
+
+#### Paginated Log Synchronization
+- **Full history import** — Postfix and Rspamd logs are now fetched using paginated API calls, importing the entire mailcow log history instead of only the most recent batch
+  - Fetches logs in configurable page sizes (`FETCH_COUNT_POSTFIX`, `FETCH_COUNT_RSPAMD`) with offset-based pagination
+  - Postfix and Rspamd run in parallel via `asyncio.gather` for faster data population
+- **Log discovery via binary-search probing** — Before fetching begins, the system probes the mailcow API at progressively finer positions (100k → 10k → 1k → 100 → 10 → 1) to determine exactly how many logs exist, enabling accurate progress logging (`Page 5/250 (2%)`) and eliminating blind pagination
+- **Configurable page limit** (`FETCH_MAX_PAGES`, default: 50) — Safety cap on pages per cycle. When the limit is reached, the current offset is saved and the next cycle resumes from exactly where it left off, ensuring complete ingestion across multiple runs
+- **Early stop on catch-up** — If an entire page contains only duplicates (no new logs), fetching stops early instead of scanning remaining pages unnecessarily
+- **Batch existence pre-check** — Each page of logs is checked against the database in a single query before insertion, preventing `UniqueViolation` errors without relying on database-level exception handling
+- **Blacklist filtering during ingestion** — Logs matching blacklisted email addresses (`BLACKLIST_EMAILS`) are filtered out during import and their related database records are cleaned up
+
+### Fixed
+
+#### GeoIP Error When MaxMind Not Configured
+- **`ERROR - Failed to load GeoIP City database` on every startup**: When MaxMind credentials are not configured, stale or empty `.mmdb` files in the data directory caused repeated ERROR-level log messages. The system now checks that database files are non-empty before attempting to load them, downgrades the message to DEBUG level, and marks GeoIP as unavailable so it does not retry
+
+#### Mailbox Stats — Case-Insensitive Email Matching
+- **Alias/mailbox message counts ignored letter case**: If an alias was stored as `test@domain.com` but a message was sent from `TEST@domain.com`, it would not be counted in the mailbox statistics. All sender/recipient comparisons in the mailbox stats module now use case-insensitive matching
+
+#### Mailbox Stats — Query Performance Issue
+- **Page took minutes to load and froze on search**: Message counting was done individually for each mailbox and alias, causing hundreds of database queries per page load. Now all counts are calculated in bulk using just 2 queries total, making the page load in seconds
+
+#### Messages — Incorrect Timestamp Displayed
+- **All messages showed the same date/time**: The messages page displayed `last_seen` (when the system processed the correlation) instead of `first_seen` (the actual email timestamp from Rspamd). This caused all messages imported in the same batch to show identical times. Now displays the real email time and sorts by it
+
+### Technical
+
+#### New Configuration Settings
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `DISABLED_FEATURES` | `""` (empty) | Comma-separated list of features to disable. Valid values: `netfilter`, `queue`, `quarantine`, `spam-filter`, `domains`, `dmarc`, `mailbox-stats`, `logs`, `blacklist` |
+| `FETCH_MAX_PAGES` | `50` | Maximum number of pages to fetch per cycle for Postfix/Rspamd (safety limit to prevent infinite loops) |
+
+#### API Changes
+- `GET /api/info` now includes `disabled_features` array in the response — lists all currently disabled feature IDs
+- `GET /api/settings/info` background jobs include `feature_disabled: true` for jobs whose feature is turned off
+- `POST /api/settings/purge-feature-data` — new endpoint to delete all database data for a disabled feature (body: `{ "feature": "<id>" }`)
+
+#### New API Endpoints
+```
+POST /api/quarantine/learnham          - Release & train as not spam (requires RW API key)
+POST /api/quarantine/learnspam         - Delete & train as spam (requires RW API key)
+GET  /api/quarantine/{id}/details      - Get full quarantine item details (proxied from mailcow)
+```
+
+---
+
+## [2.5.0] - 2026-04-23
+
+### Added
+
+#### Quarantine Auto-Rules
+- **Auto-release or delete quarantined emails** based on user-defined rules
+  - Match by Sender, Sender Domain, Recipient, or Subject — using Exact Match, Contains, or Regex
+  - Actions: Release (deliver to inbox) or Delete (permanently remove)
+  - Delete rules always take priority over Release (acl-style deny/allow)
+  - Per-rule Enable/Disable toggle, dry-run testing, and full action history log
+  - Safety limit: max actions per run (default: 50)
+- **Inline rule creation** from quarantine items — "Rule" button pre-fills sender, recipient, subject
+- **New "Quarantine" tab in Settings** and background job on Status page
+
+#### Spam Filter — Rspamd Maps Editor
+- **Direct editor for all 13 Rspamd map files** — sender/recipient deny/allow lists, bad words, fishy TLDs, and more
+  - Built-in **Regex Wizard** for generating patterns without regex knowledge
+  - **Validate** button to check regex syntax before saving
+  - Read-only mode when `MAILCOW_API_KEY_RW` is not configured
+
+#### Spam Filter — Email Suppression & Deferred Queue Cleanup
+- **Automatic email suppression** — block outgoing emails to recipients that bounce
+  - **Hard bounces (5.x.x)**: Detected from Postfix logs, recipients suppressed immediately
+  - **Deferred queue cleanup**: Scans the live mail queue every 5 min for emails stuck longer than threshold (default: 60 min) — deletes from queue and suppresses. Replaces log-based soft bounce detection for reliability on busy servers
+  - **Progressive blocking**: Each repeat bounce extends suppression (base × bounce count, capped at max)
+  - **Immediate Rspamd sync**: Suppressions pushed to Rspamd right away
+  - Manual management, import/export CSV, domain regex, permanent or timed blocks, quick-extend buttons
+- **"Suppress" button on Queue page** — quick-add recipient to suppression list
+- **Background jobs** on Status page: Detect Suppressions, Cleanup Deferred Queue, Sync to Rspamd, Expire Suppressions
+- **Spam Filter settings** grouped into clear sections: Hard Bounces, Soft Bounces, Deferred Queue Cleanup, Block Duration, Whitelist
+
+#### MaxMind GeoIP — Robust Initialization & Setup UX
+- **Eager-load at startup**, database integrity validation, auto-recovery of corrupt databases
+- **Setup Modal** when credentials are configured: credential check → download with progress bar → integrity validation
+- **Health badges in settings**: License, DB Health, combined City + ASN info
+
+#### Documentation
+- **New `Spam_Filter.md` help page** — Suppressions and Rspamd Maps user guide
+- **New `Quarantine.md` help page** — Auto-Rules guide with match modes, quick-fill, and dry-run testing
+
+### Changed
+- **Adjusted page width** to `max-w-[1400px]` for better readability on wide screens
+
+### Security
+- **Upgraded `python-dotenv` ≥1.2.2** — fixes symlink-following vulnerability
+
+### Technical
+
+#### New Configuration Settings
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `QUARANTINE_RULES_MAX_ACTIONS` | `50` | Max emails to release/delete per scheduler run |
+| `QUARANTINE_RULES_INTERVAL` | `5` | Minutes between rule processing runs |
+| `QUARANTINE_RULES_LOG_RETENTION_DAYS` | `30` | Days to keep action history |
+| `SUPPRESSION_ENABLED` | `false` | Enable the suppression system |
+| `SUPPRESSION_AUTO_DETECT` | `true` | Auto-detect hard bounces from Postfix logs |
+| `SUPPRESSION_RSPAMD_SYNC` | `true` | Auto-sync suppression list to Rspamd |
+| `SUPPRESSION_WHITELIST_DOMAINS` | `""` | Domains that should never be suppressed |
+| `SUPPRESSION_HARD_BOUNCE_ACTION` | `suppress` | Hard bounce action: suppress or ignore |
+| `SUPPRESSION_SOFT_BOUNCE_ACTION` | `count` | Soft bounce action: suppress, count, or ignore |
+| `SUPPRESSION_SOFT_BOUNCE_THRESHOLD` | `3` | Soft bounces before suppression (when action=count) |
+| `SUPPRESSION_BASE_EXPIRY_DAYS` | `7` | Base block duration in days (× bounce count) |
+| `SUPPRESSION_MAX_EXPIRY_DAYS` | `90` | Maximum block duration cap |
+| `QUEUE_CLEANUP_ENABLED` | `true` | Auto-delete stuck deferred emails from queue |
+| `QUEUE_CLEANUP_THRESHOLD_MINUTES` | `60` | Minutes before a stuck deferred email is deleted |
+
+#### New API Endpoints
+```
+GET    /api/quarantine/rules                - List all quarantine rules
+POST   /api/quarantine/rules                - Create a new rule
+PUT    /api/quarantine/rules/{id}           - Update a rule
+DELETE /api/quarantine/rules/{id}           - Delete a rule
+PUT    /api/quarantine/rules/{id}/toggle    - Enable/disable a rule
+POST   /api/quarantine/rules/test           - Dry-run test all rules against current quarantine
+GET    /api/quarantine/rules/logs           - Get action history (paginated)
+
+GET    /api/suppressions                    - List suppressions (paginated, searchable, filterable)
+GET    /api/suppressions/stats              - Suppression statistics summary
+GET    /api/suppressions/config             - Suppression feature configuration
+POST   /api/suppressions                    - Create a suppression (email or domain, permanent or timed)
+PUT    /api/suppressions/{id}               - Update suppression (notes, expiry, permanent toggle)
+DELETE /api/suppressions/{id}               - Delete a suppression permanently
+POST   /api/suppressions/import             - Bulk import from CSV
+GET    /api/suppressions/export             - Export all suppressions as CSV
+POST   /api/suppressions/sync              - Manual sync to Rspamd
+
+GET    /api/rspamd/config                   - Check Rspamd configuration status
+GET    /api/rspamd/maps                     - List all available Rspamd maps
+GET    /api/rspamd/maps/{filename}          - Read a specific Rspamd map file
+PUT    /api/rspamd/maps/{filename}          - Update a Rspamd map file (requires RW key)
+POST   /api/rspamd/validate                - Validate regex patterns
+
+GET    /api/settings/geoip/status           - Detailed GeoIP status (license, DB health, job status)
+POST   /api/settings/geoip/download         - Trigger GeoIP database download in background
+POST   /api/settings/geoip/validate         - Validate GeoIP database integrity (test IP lookups)
+```
+
+---
+
+## [2.4.0] - 2026-04-16
 
 ### Added
 

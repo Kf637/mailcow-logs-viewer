@@ -293,6 +293,7 @@ def get_geoip_status() -> dict:
     Returns:
         {
             'configured': bool,
+            'db_valid': bool | None,  # None = not checked yet
             'City': {
                 'available': bool,
                 'age_days': int,
@@ -307,8 +308,11 @@ def get_geoip_status() -> dict:
             }
         }
     """
+    from .geoip_service import get_geoip_db_valid
+    
     status = {
         'configured': is_license_configured(),
+        'db_valid': get_geoip_db_valid(),
         'City': {
             'available': False,
             'age_days': -1,

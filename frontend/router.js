@@ -10,6 +10,7 @@ const VALID_ROUTES = [
     'netfilter',
     'queue',
     'quarantine',
+    'spam-filter',
     'status',
     'domains',
     'dmarc',
@@ -143,6 +144,8 @@ function navigateTo(route, params = {}, updateHistory = true) {
         params = {};
     }
 
+    // Note: disabled feature guard is in switchTab() which shows a "Feature Disabled" page
+
     // Build the new path
     const newPath = buildPath(route, params);
 
@@ -234,7 +237,8 @@ const TAB_LABELS = {
     'dmarc': 'DMARC',
     'mailbox-stats': 'Mailbox Stats',
     'logs': 'Logs',
-    'settings': 'Settings'
+    'settings': 'Settings',
+    'spam-filter': 'Spam Filter'
 };
 
 /**

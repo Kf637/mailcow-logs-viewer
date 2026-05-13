@@ -142,59 +142,23 @@ def parse_date_range(date_range: str, start_date: Optional[str] = None, end_date
     return start, end
 
 
-def get_message_counts_for_email(db: Session, email: str, start_date: datetime, end_date: datetime) -> dict:
-    """
-    Get message counts for a specific email address (mailbox or alias)
-    Counts sent (as sender) and received (as recipient) with status breakdown
-    Also counts by direction (inbound, outbound, internal)
-    """
-    # Count sent messages (this email as sender) by status
-    sent_query = db.query(
-        MessageCorrelation.final_status,
-        func.count(MessageCorrelation.id).label('count')
-    ).filter(
-        MessageCorrelation.sender == email,
-        MessageCorrelation.first_seen >= start_date,
-        MessageCorrelation.first_seen <= end_date
-    ).group_by(MessageCorrelation.final_status).all()
-    
-    # Count received messages (this email as recipient) by status
-    received_query = db.query(
-        MessageCorrelation.final_status,
-        func.count(MessageCorrelation.id).label('count')
-    ).filter(
-        MessageCorrelation.recipient == email,
-        MessageCorrelation.first_seen >= start_date,
-        MessageCorrelation.first_seen <= end_date
-    ).group_by(MessageCorrelation.final_status).all()
-    
-    # Count by direction (inbound, outbound, internal)
-    direction_query = db.query(
-        MessageCorrelation.direction,
-        func.count(MessageCorrelation.id).label('count')
-    ).filter(
-        or_(
-            MessageCorrelation.sender == email,
-            MessageCorrelation.recipient == email
-        ),
-        MessageCorrelation.first_seen >= start_date,
-        MessageCorrelation.first_seen <= end_date
-    ).group_by(MessageCorrelation.direction).all()
-    
-    # Process results
-    sent_by_status = {row.final_status or 'unknown': row.count for row in sent_query}
-    received_by_status = {row.final_status or 'unknown': row.count for row in received_query}
-    direction_counts = {row.direction or 'unknown': row.count for row in direction_query}
-    
+def _empty_counts() -> dict:
+    """Return a zeroed-out counts dict"""
+    return {
+        "sent_total": 0, "sent_delivered": 0, "sent_bounced": 0,
+        "sent_rejected": 0, "sent_deferred": 0, "sent_expired": 0,
+        "sent_failed": 0, "received_total": 0, "total_messages": 0,
+        "failure_rate": 0.0,
+        "direction_inbound": 0, "direction_outbound": 0, "direction_internal": 0
+    }
+
+
+def _counts_from_raw(sent_by_status: dict, received_total: int, direction_counts: dict) -> dict:
+    """Build a counts dict from pre-aggregated data"""
     sent_total = sum(sent_by_status.values())
-    received_total = sum(received_by_status.values())
-    
-    # Calculate failures (only for sent messages - bounces and rejections are outbound failures)
     sent_failed = sent_by_status.get('bounced', 0) + sent_by_status.get('rejected', 0)
-    
     total = sent_total + received_total
     failure_rate = round((sent_failed / sent_total * 100) if sent_total > 0 else 0, 1)
-    
     return {
         "sent_total": sent_total,
         "sent_delivered": sent_by_status.get('delivered', 0) + sent_by_status.get('sent', 0),
@@ -206,11 +170,103 @@ def get_message_counts_for_email(db: Session, email: str, start_date: datetime, 
         "received_total": received_total,
         "total_messages": total,
         "failure_rate": failure_rate,
-        # Direction counts
         "direction_inbound": direction_counts.get('inbound', 0),
         "direction_outbound": direction_counts.get('outbound', 0),
         "direction_internal": direction_counts.get('internal', 0)
     }
+
+
+def get_bulk_message_counts(db: Session, emails: list, start_date: datetime, end_date: datetime) -> dict:
+    """
+    Get message counts for ALL emails in a single pass using 2 bulk aggregate queries.
+    Returns a dict mapping lowercase-email -> counts dict.
+
+    PERFORMANCE: This replaces the old per-email approach (3 queries × N emails = 3N queries)
+    with exactly 2 aggregate queries regardless of how many emails exist.
+    """
+    if not emails:
+        return {}
+
+    emails_lower = list({e.lower() for e in emails})
+
+    # --- Query 1: Sent stats (group by sender + status + direction) ---
+    sent_rows = db.query(
+        func.lower(MessageCorrelation.sender).label('email'),
+        MessageCorrelation.final_status,
+        MessageCorrelation.direction,
+        func.count(MessageCorrelation.id).label('cnt')
+    ).filter(
+        func.lower(MessageCorrelation.sender).in_(emails_lower),
+        MessageCorrelation.first_seen >= start_date,
+        MessageCorrelation.first_seen <= end_date
+    ).group_by(
+        func.lower(MessageCorrelation.sender),
+        MessageCorrelation.final_status,
+        MessageCorrelation.direction
+    ).all()
+
+    # --- Query 2: Received stats (group by recipient + direction) ---
+    recv_rows = db.query(
+        func.lower(MessageCorrelation.recipient).label('email'),
+        MessageCorrelation.direction,
+        func.count(MessageCorrelation.id).label('cnt')
+    ).filter(
+        func.lower(MessageCorrelation.recipient).in_(emails_lower),
+        MessageCorrelation.first_seen >= start_date,
+        MessageCorrelation.first_seen <= end_date
+    ).group_by(
+        func.lower(MessageCorrelation.recipient),
+        MessageCorrelation.direction
+    ).all()
+
+    # --- Build per-email lookup ---
+    # sent_data[email] = {status: count}
+    sent_data = {}
+    # direction_data[email] = {direction: count}  (from sent side)
+    dir_data_sent = {}
+    for row in sent_rows:
+        em = row.email
+        status = row.final_status or 'unknown'
+        direction = row.direction or 'unknown'
+        sent_data.setdefault(em, {})
+        sent_data[em][status] = sent_data[em].get(status, 0) + row.cnt
+        dir_data_sent.setdefault(em, {})
+        dir_data_sent[em][direction] = dir_data_sent[em].get(direction, 0) + row.cnt
+
+    # recv_data[email] = total_received
+    recv_data = {}
+    # direction_data from recv side
+    dir_data_recv = {}
+    for row in recv_rows:
+        em = row.email
+        direction = row.direction or 'unknown'
+        recv_data[em] = recv_data.get(em, 0) + row.cnt
+        dir_data_recv.setdefault(em, {})
+        dir_data_recv[em][direction] = dir_data_recv[em].get(direction, 0) + row.cnt
+
+    # --- Assemble per-email counts ---
+    result = {}
+    for em in emails_lower:
+        sent_by_status = sent_data.get(em, {})
+        received_total = recv_data.get(em, 0)
+        # Merge direction counts from sent + received
+        dir_counts = {}
+        for d, c in dir_data_sent.get(em, {}).items():
+            dir_counts[d] = dir_counts.get(d, 0) + c
+        for d, c in dir_data_recv.get(em, {}).items():
+            dir_counts[d] = dir_counts.get(d, 0) + c
+        result[em] = _counts_from_raw(sent_by_status, received_total, dir_counts)
+
+    return result
+
+
+def get_message_counts_for_email(db: Session, email: str, start_date: datetime, end_date: datetime) -> dict:
+    """
+    Get message counts for a single email. Thin wrapper around bulk version.
+    Kept for backward compatibility with summary endpoint.
+    """
+    bulk = get_bulk_message_counts(db, [email], start_date, end_date)
+    return bulk.get(email.lower(), _empty_counts())
 
 
 @router.get("/mailbox-stats/summary")
@@ -247,28 +303,28 @@ async def get_mailbox_stats_summary(
         # Get last update time
         last_update = db.query(func.max(MailboxStatistics.updated_at)).scalar()
         
-        # Get all local mailbox emails and alias emails
-        mailbox_emails = [m.username for m in db.query(MailboxStatistics.username).all()]
-        alias_emails = [a.alias_address for a in db.query(AliasStatistics.alias_address).all()]
+        # Get all local mailbox emails and alias emails (lowercased for case-insensitive matching)
+        mailbox_emails = [m.username.lower() for m in db.query(MailboxStatistics.username).all()]
+        alias_emails = [a.alias_address.lower() for a in db.query(AliasStatistics.alias_address).all()]
         all_local_emails = set(mailbox_emails + alias_emails)
         
-        # Count total messages for all local emails
+        # Count total messages for all local emails (case-insensitive)
         total_sent = 0
         total_received = 0
         total_failed = 0
         
         if all_local_emails:
-            # Sent messages
+            # Sent messages (case-insensitive)
             sent_result = db.query(func.count(MessageCorrelation.id)).filter(
-                MessageCorrelation.sender.in_(all_local_emails),
+                func.lower(MessageCorrelation.sender).in_(all_local_emails),
                 MessageCorrelation.first_seen >= parsed_start,
                 MessageCorrelation.first_seen <= parsed_end
             ).scalar() or 0
             total_sent = sent_result
             
-            # Received messages
+            # Received messages (case-insensitive)
             received_result = db.query(func.count(MessageCorrelation.id)).filter(
-                MessageCorrelation.recipient.in_(all_local_emails),
+                func.lower(MessageCorrelation.recipient).in_(all_local_emails),
                 MessageCorrelation.first_seen >= parsed_start,
                 MessageCorrelation.first_seen <= parsed_end
             ).scalar() or 0
@@ -276,7 +332,7 @@ async def get_mailbox_stats_summary(
             
             # Failed messages (only sent that bounced/rejected - failures are outbound)
             failed_result = db.query(func.count(MessageCorrelation.id)).filter(
-                MessageCorrelation.sender.in_(all_local_emails),
+                func.lower(MessageCorrelation.sender).in_(all_local_emails),
                 MessageCorrelation.first_seen >= parsed_start,
                 MessageCorrelation.first_seen <= parsed_end,
                 MessageCorrelation.final_status.in_(['bounced', 'rejected'])
@@ -360,7 +416,7 @@ async def get_all_mailbox_stats(
             # Find mailboxes that have matching aliases
             alias_matched_usernames = db.query(AliasStatistics.primary_mailbox).filter(
                 AliasStatistics.alias_address.ilike(mailbox_search_term)
-            ).distinct().subquery()
+            ).distinct().scalar_subquery()
             
             query = query.filter(
                 or_(
@@ -376,18 +432,28 @@ async def get_all_mailbox_stats(
         # Get all for sorting (we need to calculate counts before pagination)
         mailboxes = query.all()
         
-        # Build result with message counts for each mailbox
+        # Pre-load ALL aliases in one query (avoids N+1 alias queries)
+        all_aliases = db.query(AliasStatistics).all()
+        aliases_by_mailbox = {}
+        for alias in all_aliases:
+            aliases_by_mailbox.setdefault(alias.primary_mailbox, []).append(alias)
+        
+        # Collect ALL emails (mailboxes + aliases) for bulk counting
+        all_emails = [mb.username for mb in mailboxes]
+        for mb in mailboxes:
+            for alias in aliases_by_mailbox.get(mb.username, []):
+                all_emails.append(alias.alias_address)
+        
+        # Run bulk message counts (2 SQL queries total instead of 3×N)
+        bulk_counts = get_bulk_message_counts(db, all_emails, parsed_start, parsed_end)
+        
+        # Build result using pre-computed counts
         result = []
         for mb in mailboxes:
-            # Get message counts for this mailbox
-            counts = get_message_counts_for_email(db, mb.username, parsed_start, parsed_end)
+            counts = bulk_counts.get(mb.username.lower(), _empty_counts())
             
-            # Get aliases for this mailbox
-            aliases = db.query(AliasStatistics).filter(
-                AliasStatistics.primary_mailbox == mb.username
-            ).all()
+            aliases = aliases_by_mailbox.get(mb.username, [])
             
-            # Get message counts for each alias
             alias_list = []
             alias_sent_total = 0
             alias_received_total = 0
@@ -396,7 +462,7 @@ async def get_all_mailbox_stats(
             alias_delivered_total = 0
             
             for alias in aliases:
-                alias_counts = get_message_counts_for_email(db, alias.alias_address, parsed_start, parsed_end)
+                alias_counts = bulk_counts.get(alias.alias_address.lower(), _empty_counts())
                 alias_sent_total += alias_counts['sent_total']
                 alias_received_total += alias_counts['received_total']
                 alias_failed_total += alias_counts['sent_failed']

@@ -30,6 +30,9 @@ from .routers import (
     reporting,
     auth as auth_router,
     raw_logs as raw_logs_router,
+    rspamd_maps as rspamd_maps_router,
+    suppressions as suppressions_router,
+    quarantine_rules as quarantine_rules_router,
 )
 from .migrations import run_migrations
 from .auth import BasicAuthMiddleware, verify_credentials
@@ -37,7 +40,6 @@ from .session import get_session_from_request
 from .version import __version__
 
 from .services.geoip_downloader import (
-    update_geoip_database_if_needed,
     is_license_configured,
     get_geoip_status
 )
@@ -110,31 +112,29 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Authentication is DISABLED")
     
-    # Initialize GeoIP database (if configured)
+    # GeoIP initialization
     try:
         if is_license_configured():
-            logger.info("MaxMind license key configured, checking GeoIP database...")
-            
-            # This will:
-            # 1. Check if database exists
-            # 2. Check if it's older than 7 days
-            # 3. Download if needed
-            # 4. Skip if database is fresh
-            db_available = update_geoip_database_if_needed()
-
-            if db_available:
-                status = get_geoip_status()
-                city_info = status['City']
-                asn_info = status['ASN']
-                logger.info(f"✓ GeoIP ready: City {city_info['size_mb']}MB ({city_info['age_days']}d), ASN {asn_info['size_mb']}MB ({asn_info['age_days']}d)")
+            status = get_geoip_status()
+            city_info = status['City']
+            asn_info = status['ASN']
+            if city_info['available']:
+                logger.info(f"GeoIP databases found: City {city_info['size_mb']}MB ({city_info['age_days']}d), ASN {asn_info['size_mb']}MB ({asn_info['age_days']}d)")
+                # Eagerly load and validate readers so GeoIP works from the first fetch cycle
+                from .services import geoip_service
+                geoip_service.reload_geoip_readers()
+                if geoip_service.get_geoip_db_valid():
+                    logger.info("GeoIP databases loaded and validated — ready for use")
+                else:
+                    logger.warning("GeoIP databases found but validation failed — will re-download in background")
+                logger.info("GeoIP update check will run in background (60s after startup)")
             else:
-                logger.warning("⚠ GeoIP database unavailable, features will be disabled")
+                logger.info("GeoIP databases not yet downloaded — will download in background (60s after startup)")
         else:
             logger.info("MaxMind license key not configured, GeoIP features disabled")
             logger.info("To enable: Set MAXMIND_ACCOUNT_ID and MAXMIND_LICENSE_KEY environment variables")
     except Exception as e:
-        logger.error(f"Error initializing GeoIP database: {e}")
-        logger.info("Continuing without GeoIP features...")
+        logger.error(f"Error initializing GeoIP: {e}")
 
     # Test mailcow API connection and fetch active domains
     try:
@@ -223,6 +223,9 @@ app.include_router(mailbox_stats_router.router, prefix="/api", tags=["Mailbox St
 app.include_router(documentation.router, prefix="/api", tags=["Documentation"])
 app.include_router(blacklist_router.router, prefix="/api/blacklist", tags=["Blacklist"])
 app.include_router(raw_logs_router.router, prefix="/api", tags=["Raw Logs"])
+app.include_router(rspamd_maps_router.router, prefix="/api", tags=["Rspamd Maps"])
+app.include_router(suppressions_router.router, prefix="/api", tags=["Suppressions"])
+app.include_router(quarantine_rules_router.router, tags=["Quarantine Rules"])
 
 # WebSocket endpoint needs root-level mount (not under /api prefix)
 # The router contains /ws/raw-logs which should be accessible at ws://host/ws/raw-logs
@@ -309,6 +312,7 @@ async def app_info(request: Request):
         "auth_enabled": settings.is_authentication_enabled,
         "basic_auth_enabled": settings.is_basic_auth_enabled,
         "oauth2_enabled": settings.is_oauth2_enabled,
+        "disabled_features": sorted(settings.disabled_features_set),
     }
 
     if is_logged_in:

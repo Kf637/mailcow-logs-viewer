@@ -426,6 +426,92 @@ let currentModalData = null;
 // Global RW API key status (shared across all features)
 let mailcowRwConfigured = false;
 
+// Feature toggles — features in this list are disabled (hidden from UI, jobs stopped)
+window.disabledFeatures = [];
+
+// All toggleable feature definitions (for settings UI)
+const TOGGLEABLE_FEATURES = [
+    { id: 'netfilter', label: 'Security', description: 'Fail2Ban management and security events' },
+    { id: 'queue', label: 'Queue', description: 'Mail queue monitoring' },
+    { id: 'quarantine', label: 'Quarantine', description: 'Quarantined emails and auto-rules' },
+    { id: 'spam-filter', label: 'Spam Filter', description: 'Bounce suppression and Rspamd maps' },
+    { id: 'domains', label: 'Domains', description: 'Domain DNS analysis and transports' },
+    { id: 'dmarc', label: 'DMARC', description: 'DMARC/TLS reports and IMAP sync' },
+    { id: 'mailbox-stats', label: 'Mailbox Stats', description: 'Mailbox and alias statistics' },
+    { id: 'logs', label: 'Logs', description: 'Raw service log viewer' },
+    { id: 'blacklist', label: 'IP Blacklist Monitor', description: 'DNS blacklist monitoring for your IPs' },
+];
+
+function isFeatureDisabled(featureId) {
+    return window.disabledFeatures.includes(featureId);
+}
+
+function applyFeatureToggles() {
+    // Hide desktop and mobile tabs for disabled features
+    for (const feature of window.disabledFeatures) {
+        // Desktop tab
+        const tab = document.getElementById(`tab-${feature}`);
+        if (tab) tab.style.display = 'none';
+        // Mobile tab
+        const mobileTab = document.getElementById(`mobile-tab-${feature}`);
+        if (mobileTab) mobileTab.style.display = 'none';
+    }
+    // Ensure enabled features are visible (in case of settings change)
+    for (const feature of TOGGLEABLE_FEATURES) {
+        if (!window.disabledFeatures.includes(feature.id)) {
+            const tab = document.getElementById(`tab-${feature.id}`);
+            if (tab) tab.style.display = '';
+            const mobileTab = document.getElementById(`mobile-tab-${feature.id}`);
+            if (mobileTab) mobileTab.style.display = '';
+        }
+    }
+    
+    // Special handling for blacklist feature — it doesn't have its own tab,
+    // it's a section inside the Domains page
+    const blacklistSection = document.getElementById('blacklist-section');
+    const dashboardBlacklistCard = document.getElementById('dashboard-blacklist-card');
+    if (window.disabledFeatures.includes('blacklist')) {
+        if (blacklistSection) blacklistSection.style.display = 'none';
+        if (dashboardBlacklistCard) dashboardBlacklistCard.style.display = 'none';
+    } else {
+        if (blacklistSection) blacklistSection.style.display = '';
+        if (dashboardBlacklistCard) dashboardBlacklistCard.style.display = '';
+    }
+}
+
+function updateDisabledFeaturesCheckbox(featureId, isChecked, el) {
+    // Update the hidden input value
+    const hiddenInput = document.getElementById('setting-disabled_features');
+    if (!hiddenInput) return;
+
+    const currentDisabled = new Set(
+        hiddenInput.value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+    );
+
+    if (isChecked) {
+        // Feature is being enabled (checked) — remove from disabled list
+        currentDisabled.delete(featureId);
+    } else {
+        // Feature is being disabled (unchecked) — add to disabled list
+        currentDisabled.add(featureId);
+    }
+
+    hiddenInput.value = Array.from(currentDisabled).sort().join(',');
+
+    // Update visual styling of the label
+    const label = el ? el.closest('label') : null;
+    if (label) {
+        if (isChecked) {
+            label.classList.remove('border-gray-200', 'dark:border-gray-700', 'bg-gray-50/50', 'dark:bg-gray-800/50', 'opacity-60');
+            label.classList.add('border-green-200', 'dark:border-green-700/50', 'bg-green-50/50', 'dark:bg-green-900/10');
+        } else {
+            label.classList.remove('border-green-200', 'dark:border-green-700/50', 'bg-green-50/50', 'dark:bg-green-900/10');
+            label.classList.add('border-gray-200', 'dark:border-gray-700', 'bg-gray-50/50', 'dark:bg-gray-800/50', 'opacity-60');
+        }
+    }
+}
+
+
 async function fetchRwStatus() {
     try {
         const res = await authenticatedFetch('/api/rw-status');
@@ -474,7 +560,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         console.log('[OK] All required DOM elements found');
     }
 
-    loadAppInfo();
+    await loadAppInfo();
     loadMailcowVersionStatus();
     fetchRwStatus();
 
@@ -543,6 +629,13 @@ async function loadAppInfo() {
             console.log('Timezone loaded from API:', appTimezone);
         } else {
             console.warn('No timezone in API response, using default:', appTimezone);
+        }
+
+        // Load disabled features and apply tab hiding
+        if (data.disabled_features && Array.isArray(data.disabled_features)) {
+            window.disabledFeatures = data.disabled_features;
+            console.log('Disabled features:', window.disabledFeatures);
+            applyFeatureToggles();
         }
 
         // Load app version status for update check
@@ -783,6 +876,9 @@ async function smartRefreshCurrentTab() {
             case 'settings':
                 await smartRefreshSettings();
                 break;
+            case 'spam-filter':
+                await smartRefreshSpamFilter();
+                break;
         }
     } catch (error) {
         console.error('Auto-refresh error:', error);
@@ -877,7 +973,7 @@ function renderMessagesData(data) {
                         </div>
                     </div>
                     <div class="flex flex-wrap items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
-                        <span>${formatTime(msg.last_seen)}</span>
+                        <span>${formatTime(msg.first_seen)}</span>
                         ${msg.queue_id ? `<span class="font-mono" title="Queue ID">Q: ${msg.queue_id}</span>` : ''}
                         ${msg.message_id ? `<span class="font-mono truncate max-w-xs" title="Message ID: ${escapeHtml(msg.message_id)}">MID: ${escapeHtml(msg.message_id.substring(0, 20))}${msg.message_id.length > 20 ? '...' : ''}</span>` : ''}
                         ${msg.spam_score !== null ? `<span>Score: <span class="${msg.spam_score >= 15 ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-gray-600 dark:text-gray-300'}">${msg.spam_score.toFixed(1)}</span></span>` : ''}
@@ -997,7 +1093,7 @@ function renderNetfilterData(data) {
 
 async function unbanIP(ip, btnEl) {
     const ipWithMask = ip.includes('/') ? ip : ip + '/32';
-    if (!confirm('Unban IP ' + ipWithMask + '?')) return;
+    if (!await showConfirmModal({ title: 'Unban IP', message: 'Unban IP ' + ipWithMask + '?', confirmText: 'Unban' })) return;
     try {
         if (btnEl) {
             btnEl.disabled = true;
@@ -1034,7 +1130,7 @@ async function unbanIP(ip, btnEl) {
 
 async function banIP(ip, btnEl) {
     const ipWithMask = ip.includes('/') ? ip : ip + '/32';
-    if (!confirm(`Are you sure you want to permanently ban ${ipWithMask}?\n\nThis will add the IP to the Fail2Ban blacklist.`)) return;
+    if (!await showConfirmModal({ title: 'Ban IP', message: `Are you sure you want to permanently ban ${ipWithMask}?\n\nThis will add the IP to the Fail2Ban blacklist.`, confirmText: 'Ban', isDangerous: true })) return;
 
     if (btnEl) {
         btnEl.disabled = true;
@@ -1236,6 +1332,49 @@ async function smartRefreshSettings() {
 
 function switchTab(tab, params = {}) {
     console.log('Switching to tab:', tab, 'params:', params);
+
+    // Block disabled features — show a "Feature Disabled" page
+    if (window.disabledFeatures.includes(tab)) {
+        const feature = TOGGLEABLE_FEATURES.find(f => f.id === tab);
+        const featureLabel = feature ? feature.label : tab;
+        console.warn(`Feature '${tab}' is disabled`);
+
+        currentTab = tab;
+
+        // Hide all tab contents
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.add('hidden'));
+
+        // Show current tab with a disabled message
+        const tabContent = document.getElementById(`content-${tab}`);
+        if (tabContent) {
+            tabContent.classList.remove('hidden');
+            tabContent.innerHTML = `
+                <div class="flex items-center justify-center min-h-[60vh]">
+                    <div class="text-center max-w-md">
+                        <div class="w-16 h-16 mx-auto mb-6 rounded-full bg-gray-100 dark:bg-gray-700 flex items-center justify-center">
+                            <svg class="w-8 h-8 text-gray-400 dark:text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                                    d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                            </svg>
+                        </div>
+                        <h2 class="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-2">${escapeHtml(featureLabel)} is disabled</h2>
+                        <p class="text-gray-500 dark:text-gray-400 mb-6">This feature has been turned off by the administrator in Settings → Application → Features.</p>
+                        <button onclick="navigateTo('dashboard')"
+                            class="px-5 py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors">
+                            Go to Dashboard
+                        </button>
+                    </div>
+                </div>`;
+        }
+
+        // Update URL to reflect the disabled page (don't silently change to dashboard)
+        const newPath = typeof buildPath === 'function' ? buildPath(tab) : `/${tab}`;
+        if (window.location.pathname !== newPath) {
+            history.replaceState({ route: tab, params: {} }, '', newPath);
+        }
+        return;
+    }
+
     currentTab = tab;
 
     // Update active tab button (desktop)
@@ -1295,6 +1434,7 @@ function switchTab(tab, params = {}) {
             break;
         case 'quarantine':
             loadQuarantine();
+            initQuarantineRules();
             break;
         case 'status':
             loadStatus();
@@ -1313,6 +1453,9 @@ function switchTab(tab, params = {}) {
             break;
         case 'settings':
             loadSettings();
+            break;
+        case 'spam-filter':
+            loadSpamFilter();
             break;
         default:
             console.warn('Unknown tab:', tab);
@@ -2476,12 +2619,20 @@ function applyQueueFilters() {
                     </div>
                     <div class="mb-2">
                         <p class="text-sm font-medium text-gray-700 dark:text-gray-300">Recipients:</p>
-                        ${item.recipients.map(r => `<p class="text-sm text-gray-600 dark:text-gray-400">${copyableText(r)}</p>`).join('')}
+                        ${item.recipients.map(r => {
+                            const emailOnly = r.split(' ')[0].replace(/[<>]/g, '').trim();
+                            const errorPart = r.substring(r.indexOf(' ')).trim();
+                            const hasError = errorPart && errorPart !== emailOnly && r.includes(' ');
+                            return `<div class="ml-1 py-0.5">
+                                <span class="text-sm font-medium text-gray-800 dark:text-gray-200">${copyableText(emailOnly)}</span>
+                                ${hasError ? `<p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 break-words">${escapeHtml(errorPart)}</p>` : ''}
+                            </div>`;
+                        }).join('')}
                     </div>
                     <div class="flex flex-wrap items-center justify-between gap-2">
                         <span class="text-xs text-gray-500 dark:text-gray-400">Size: ${formatSize(item.message_size)}</span>
-                        ${canAct ? `
-                            <div class="flex items-center gap-2 flex-shrink-0">
+                        <div class="flex items-center gap-2 flex-shrink-0">
+                            ${canAct ? `
                                 <button onclick="queueRetry('${qid}')" title="Retry delivery"
                                     class="queue-action-btn px-2.5 py-1 text-xs font-medium rounded-md border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors flex items-center gap-1">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
@@ -2505,8 +2656,17 @@ function applyQueueFilters() {
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                                     Delete
                                 </button>
-                            </div>
-                        ` : ''}
+                            ` : ''}
+                            ${item.recipients.map(r => {
+                                const emailOnly = r.split(' ')[0].replace(/[<>]/g, '');
+                                return `
+                                <button onclick="showAddSuppressionModal('${escapeHtml(emailOnly)}')" title="Suppress ${escapeHtml(emailOnly)}"
+                                    class="px-2.5 py-1 text-xs font-medium rounded-md border border-purple-300 dark:border-purple-700 text-purple-700 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 transition-colors flex items-center gap-1">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg>
+                                    Suppress
+                                </button>`;
+                            }).join('')}
+                        </div>
                     </div>
                 </div>
             `;
@@ -2520,6 +2680,7 @@ function clearQueueFilters() {
     document.getElementById('queue-filter-queue-id').value = '';
     applyQueueFilters();
 }
+
 // --- Queue selection helpers ---
 
 function queueUpdateSelection() {
@@ -2555,14 +2716,14 @@ function queueGetSelectedIds() {
 async function queueBulkRetry() {
     const ids = queueGetSelectedIds();
     if (ids.length === 0) return;
-    if (!confirm(`Retry delivery of ${ids.length} message(s)?`)) return;
+    if (!await showConfirmModal({ title: 'Retry Delivery', message: `Retry delivery of ${ids.length} message(s)?`, confirmText: 'Retry' })) return;
     await queueAction('deliver', ids);
 }
 
 async function queueBulkDelete() {
     const ids = queueGetSelectedIds();
     if (ids.length === 0) return;
-    if (!confirm(`Permanently delete ${ids.length} message(s) from the queue?`)) return;
+    if (!await showConfirmModal({ title: 'Delete Messages', message: `Permanently delete ${ids.length} message(s) from the queue?`, confirmText: 'Delete', isDangerous: true })) return;
     await queueDeleteRequest(ids);
 }
 
@@ -2581,17 +2742,17 @@ async function queueUnhold(qid) {
 }
 
 async function queueDeleteItem(qid) {
-    if (!confirm('Delete this message from the queue?')) return;
+    if (!await showConfirmModal({ title: 'Delete Message', message: 'Delete this message from the queue?', confirmText: 'Delete', isDangerous: true })) return;
     await queueDeleteRequest([String(qid)]);
 }
 
 async function queueFlushAll() {
-    if (!confirm('Flush (retry delivery of) ALL messages in the queue?')) return;
+    if (!await showConfirmModal({ title: 'Flush Queue', message: 'Flush (retry delivery of) ALL messages in the queue?', confirmText: 'Flush All' })) return;
     await queueAction('flush', ['mailqitems-all']);
 }
 
 async function queueDeleteAll() {
-    if (!confirm('Permanently delete ALL messages from the queue? This cannot be undone.')) return;
+    if (!await showConfirmModal({ title: 'Delete All', message: 'Permanently delete ALL messages from the queue? This cannot be undone.', confirmText: 'Delete All', isDangerous: true })) return;
     await queueAction('super_delete', ['mailqitems-all']);
 }
 
@@ -2725,6 +2886,16 @@ function renderQuarantineData(data) {
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                     Delete Selected
                 </button>
+                <button onclick="quarantineBulkLearnHam()" id="quarantine-bulk-learnham-btn"
+                    class="hidden px-3 py-1.5 text-xs font-medium rounded-md border border-emerald-500 bg-emerald-500 text-white hover:bg-emerald-600 transition-colors flex items-center gap-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+                    Not Spam
+                </button>
+                <button onclick="quarantineBulkLearnSpam()" id="quarantine-bulk-learnspam-btn"
+                    class="hidden px-3 py-1.5 text-xs font-medium rounded-md border border-orange-500 bg-orange-500 text-white hover:bg-orange-600 transition-colors flex items-center gap-1">
+                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg>
+                    Learn Spam
+                </button>
                 <span id="quarantine-selection-count" class="hidden text-xs text-gray-500 dark:text-gray-400"></span>
 
                 <div class="flex-1"></div>
@@ -2760,7 +2931,7 @@ function renderQuarantineData(data) {
                                     </svg>
                                     <span class="text-sm text-gray-600 dark:text-gray-300">${copyableText(item.rcpt || 'Unknown')}</span>
                                 </div>
-                                <p class="text-xs text-gray-500 dark:text-gray-400 truncate" title="${escapeHtml(item.subject || 'No subject')}">${escapeHtml(item.subject || 'No subject')}</p>
+                                <p class="text-xs text-gray-500 dark:text-gray-400 truncate cursor-pointer hover:text-blue-500 dark:hover:text-blue-400 transition-colors" title="Click to view details" onclick="showQuarantineDetails('${itemId}')">${escapeHtml(item.subject || 'No subject')}</p>
                             </div>
                         </div>
                         <div class="flex flex-wrap items-center gap-2 flex-shrink-0 sm:justify-end">
@@ -2768,26 +2939,46 @@ function renderQuarantineData(data) {
                             ${item.virus_flag ? '<span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-300">🦠 VIRUS</span>' : ''}
                         </div>
                     </div>
-                    <div class="flex flex-wrap items-center justify-between gap-2">
-                        <div class="flex flex-wrap items-center gap-4 text-xs text-gray-600 dark:text-gray-400">
+                    <div class="flex flex-col gap-2">
+                        <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-600 dark:text-gray-400">
                             <span>${formatTime(item.created)}</span>
                             ${item.qid ? `<span class="font-mono" title="Queue ID">Q: ${copyableText(item.qid)}</span>` : ''}
                             ${item.score !== undefined && item.score !== null ? `<span>Score: <span class="${item.score >= 15 ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-gray-600 dark:text-gray-300'}">${item.score.toFixed(1)}</span></span>` : ''}
                         </div>
-                        ${canAct ? `
-                            <div class="flex items-center gap-2 flex-shrink-0">
+                        <div class="flex flex-wrap gap-1">
+                            <button onclick="showQuarantineDetails('${itemId}')" title="View details"
+                                class="quarantine-action-btn px-2 py-1 text-xs font-medium rounded-md border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors flex items-center justify-center gap-1">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
+                                Details
+                            </button>
+                            ${canAct ? `
                                 <button onclick="quarantineRelease('${itemId}')" title="Release message"
-                                    class="quarantine-action-btn px-2.5 py-1 text-xs font-medium rounded-md border border-green-300 dark:border-green-700 text-green-700 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/30 transition-colors flex items-center gap-1">
+                                    class="quarantine-action-btn px-2 py-1 text-xs font-medium rounded-md border border-green-300 dark:border-green-700 text-green-700 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/30 transition-colors flex items-center justify-center gap-1">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
                                     Release
                                 </button>
                                 <button onclick="quarantineDelete('${itemId}')" title="Delete message"
-                                    class="quarantine-action-btn px-2.5 py-1 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors flex items-center gap-1">
+                                    class="quarantine-action-btn px-2 py-1 text-xs font-medium rounded-md border border-red-300 dark:border-red-700 text-red-700 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors flex items-center justify-center gap-1">
                                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
                                     Delete
                                 </button>
-                            </div>
-                        ` : ''}
+                                <button onclick="quarantineLearnHam('${itemId}')" title="Release & train as Not Spam"
+                                    class="quarantine-action-btn px-2 py-1 text-xs font-medium rounded-md border border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-400 hover:bg-emerald-100 dark:hover:bg-emerald-900/30 transition-colors flex items-center justify-center gap-1">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+                                    Not Spam
+                                </button>
+                                <button onclick="quarantineLearnSpam('${itemId}')" title="Delete & train as Spam"
+                                    class="quarantine-action-btn px-2 py-1 text-xs font-medium rounded-md border border-orange-300 dark:border-orange-700 text-orange-700 dark:text-orange-400 hover:bg-orange-100 dark:hover:bg-orange-900/30 transition-colors flex items-center justify-center gap-1">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg>
+                                    Spam
+                                </button>
+                                <button onclick="showAddRuleFromQuarantine('${escapeHtml((item.sender || '').replace(/'/g, "\\\\'"))}', '${escapeHtml((item.rcpt || '').replace(/'/g, "\\\\'"))}', '${escapeHtml((item.subject || '').replace(/'/g, "\\\\'"))}')" title="Create auto-rule from this email"
+                                    class="quarantine-action-btn px-2 py-1 text-xs font-medium rounded-md border border-amber-300 dark:border-amber-700 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors flex items-center justify-center gap-1">
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                                    Rule
+                                </button>
+                            ` : ''}
+                        </div>
                     </div>
                 </div>
             `;
@@ -2800,17 +2991,14 @@ function renderQuarantineData(data) {
 
 function quarantineUpdateSelection() {
     const checked = document.querySelectorAll('.quarantine-checkbox:checked');
-    const bulkRelease = document.getElementById('quarantine-bulk-release-btn');
-    const bulkDelete = document.getElementById('quarantine-bulk-delete-btn');
+    const bulkBtns = ['quarantine-bulk-release-btn', 'quarantine-bulk-delete-btn', 'quarantine-bulk-learnham-btn', 'quarantine-bulk-learnspam-btn'];
     const countLabel = document.getElementById('quarantine-selection-count');
 
     if (checked.length > 0) {
-        if (bulkRelease) { bulkRelease.classList.remove('hidden'); bulkRelease.classList.add('inline-flex'); }
-        if (bulkDelete) { bulkDelete.classList.remove('hidden'); bulkDelete.classList.add('inline-flex'); }
+        bulkBtns.forEach(id => { const el = document.getElementById(id); if (el) { el.classList.remove('hidden'); el.classList.add('inline-flex'); } });
         if (countLabel) { countLabel.classList.remove('hidden'); countLabel.textContent = `${checked.length} selected`; }
     } else {
-        if (bulkRelease) { bulkRelease.classList.add('hidden'); bulkRelease.classList.remove('inline-flex'); }
-        if (bulkDelete) { bulkDelete.classList.add('hidden'); bulkDelete.classList.remove('inline-flex'); }
+        bulkBtns.forEach(id => { const el = document.getElementById(id); if (el) { el.classList.add('hidden'); el.classList.remove('inline-flex'); } });
         if (countLabel) { countLabel.classList.add('hidden'); countLabel.textContent = ''; }
     }
 }
@@ -2833,45 +3021,74 @@ async function quarantineRelease(itemId) {
 }
 
 async function quarantineDelete(itemId) {
-    if (!confirm('Are you sure you want to permanently delete this quarantined message?')) return;
+    if (!await showConfirmModal({ title: 'Delete Message', message: 'Are you sure you want to permanently delete this quarantined message?', confirmText: 'Delete', isDangerous: true })) return;
     await quarantineAction('delete', [String(itemId)]);
+}
+
+async function quarantineLearnHam(itemId) {
+    if (!await showConfirmModal({ title: 'Not Spam', message: 'Release this message and train Rspamd that it is not spam?', confirmText: 'Not Spam' })) return;
+    await quarantineAction('learnham', [String(itemId)]);
+}
+
+async function quarantineLearnSpam(itemId) {
+    if (!await showConfirmModal({ title: 'Mark as Spam', message: 'Delete this message and train Rspamd that it IS spam?', confirmText: 'Spam', isDangerous: true })) return;
+    await quarantineAction('learnspam', [String(itemId)]);
 }
 
 async function quarantineBulkRelease() {
     const ids = quarantineGetSelectedIds();
     if (ids.length === 0) return;
-    if (!confirm(`Release ${ids.length} quarantined message(s)?`)) return;
+    if (!await showConfirmModal({ title: 'Release Messages', message: `Release ${ids.length} quarantined message(s)?`, confirmText: 'Release' })) return;
     await quarantineAction('release', ids);
 }
 
 async function quarantineBulkDelete() {
     const ids = quarantineGetSelectedIds();
     if (ids.length === 0) return;
-    if (!confirm(`Permanently delete ${ids.length} quarantined message(s)?`)) return;
+    if (!await showConfirmModal({ title: 'Delete Messages', message: `Permanently delete ${ids.length} quarantined message(s)?`, confirmText: 'Delete', isDangerous: true })) return;
     await quarantineAction('delete', ids);
+}
+
+async function quarantineBulkLearnHam() {
+    const ids = quarantineGetSelectedIds();
+    if (ids.length === 0) return;
+    if (!await showConfirmModal({ title: 'Not Spam', message: `Release ${ids.length} message(s) and train Rspamd as not spam?`, confirmText: 'Not Spam' })) return;
+    await quarantineAction('learnham', ids);
+}
+
+async function quarantineBulkLearnSpam() {
+    const ids = quarantineGetSelectedIds();
+    if (ids.length === 0) return;
+    if (!await showConfirmModal({ title: 'Mark as Spam', message: `Delete ${ids.length} message(s) and train Rspamd as spam?`, confirmText: 'Spam', isDangerous: true })) return;
+    await quarantineAction('learnspam', ids);
 }
 
 async function quarantineReleaseAll() {
     const allIds = Array.from(document.querySelectorAll('.quarantine-checkbox')).map(cb => cb.value).filter(Boolean);
     if (allIds.length === 0) return;
-    if (!confirm(`Release ALL ${allIds.length} quarantined message(s)?`)) return;
+    if (!await showConfirmModal({ title: 'Release All', message: `Release ALL ${allIds.length} quarantined message(s)?`, confirmText: 'Release All' })) return;
     await quarantineAction('release', allIds);
 }
 
 async function quarantineDeleteAll() {
     const allIds = Array.from(document.querySelectorAll('.quarantine-checkbox')).map(cb => cb.value).filter(Boolean);
     if (allIds.length === 0) return;
-    if (!confirm(`Permanently delete ALL ${allIds.length} quarantined message(s)? This cannot be undone.`)) return;
+    if (!await showConfirmModal({ title: 'Delete All', message: `Permanently delete ALL ${allIds.length} quarantined message(s)? This cannot be undone.`, confirmText: 'Delete All', isDangerous: true })) return;
     await quarantineAction('delete', allIds);
 }
 
 async function quarantineAction(action, itemIds) {
-    // Disable all action buttons while processing
-    document.querySelectorAll('.quarantine-action-btn, .quarantine-checkbox, #quarantine-bulk-release-btn, #quarantine-bulk-delete-btn, #quarantine-select-all-btn, #quarantine-release-all-btn, #quarantine-delete-all-btn')
-        .forEach(el => { el.disabled = true; el.style.opacity = '0.5'; });
+    const allBtns = '.quarantine-action-btn, .quarantine-checkbox, #quarantine-bulk-release-btn, #quarantine-bulk-delete-btn, #quarantine-bulk-learnham-btn, #quarantine-bulk-learnspam-btn, #quarantine-select-all-btn, #quarantine-release-all-btn, #quarantine-delete-all-btn';
+    document.querySelectorAll(allBtns).forEach(el => { el.disabled = true; el.style.opacity = '0.5'; });
 
     try {
-        const endpoint = action === 'release' ? '/api/quarantine/release' : '/api/quarantine/delete';
+        const endpoints = {
+            'release': '/api/quarantine/release',
+            'delete': '/api/quarantine/delete',
+            'learnham': '/api/quarantine/learnham',
+            'learnspam': '/api/quarantine/learnspam'
+        };
+        const endpoint = endpoints[action] || '/api/quarantine/' + action;
         const res = await authenticatedFetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2879,9 +3096,9 @@ async function quarantineAction(action, itemIds) {
         });
 
         const result = await res.json();
+        const actionLabels = { release: 'released', delete: 'deleted', learnham: 'released & marked as not spam', learnspam: 'deleted & marked as spam' };
         if (res.ok && result.status === 'success') {
-            showToast(result.msg || `Message(s) ${action === 'release' ? 'released' : 'deleted'} successfully`, 'success');
-            // Refresh quarantine list
+            showToast(result.msg || `Message(s) ${actionLabels[action] || action} successfully`, 'success');
             lastDataCache.quarantine = null;
             await loadQuarantine();
         } else {
@@ -2890,8 +3107,627 @@ async function quarantineAction(action, itemIds) {
     } catch (err) {
         showToast(`Failed to ${action} message(s): ` + err.message, 'error');
     } finally {
-        document.querySelectorAll('.quarantine-action-btn, .quarantine-checkbox, #quarantine-bulk-release-btn, #quarantine-bulk-delete-btn, #quarantine-select-all-btn, #quarantine-release-all-btn, #quarantine-delete-all-btn')
-            .forEach(el => { el.disabled = false; el.style.opacity = ''; });
+        document.querySelectorAll(allBtns).forEach(el => { el.disabled = false; el.style.opacity = ''; });
+    }
+}
+
+// --- Quarantine Detail View ---
+
+async function showQuarantineDetails(itemId) {
+    // Create modal backdrop
+    const existing = document.getElementById('quarantine-detail-modal');
+    if (existing) existing.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'quarantine-detail-modal';
+    modal.className = 'fixed inset-0 z-[9999] flex items-center justify-center p-4';
+    modal.innerHTML = `
+        <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="closeQuarantineDetails()"></div>
+        <div class="relative bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
+            <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Quarantine Item Details</h3>
+                <button onclick="closeQuarantineDetails()" class="p-1 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors">
+                    <svg class="w-5 h-5 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="flex-1 overflow-y-auto p-4" id="quarantine-detail-content">
+                <div class="flex items-center justify-center py-12">
+                    <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+                    <span class="ml-3 text-gray-500 dark:text-gray-400">Loading details...</span>
+                </div>
+            </div>
+            <div id="quarantine-detail-footer" class="hidden"></div>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    document.body.style.overflow = 'hidden';
+
+    try {
+        const res = await authenticatedFetch(`/api/quarantine/${itemId}/details`);
+        if (!res.ok) throw new Error('Failed to fetch details');
+        const data = await res.json();
+        renderQuarantineDetailContent(data, itemId);
+    } catch (err) {
+        document.getElementById('quarantine-detail-content').innerHTML = `
+            <div class="text-center py-12 text-red-500">
+                <p class="font-medium">Failed to load details</p>
+                <p class="text-sm mt-1">${escapeHtml(err.message)}</p>
+            </div>`;
+    }
+}
+
+function closeQuarantineDetails() {
+    const modal = document.getElementById('quarantine-detail-modal');
+    if (modal) modal.remove();
+    document.body.style.overflow = '';
+}
+
+function renderQuarantineDetailContent(data, itemId) {
+    const content = document.getElementById('quarantine-detail-content');
+    const footer = document.getElementById('quarantine-detail-footer');
+    if (!content) return;
+
+    const allSymbols = (data.symbols || []);
+    const activeSymbols = allSymbols.filter(s => (s.score || 0) !== 0).sort((a, b) => Math.abs(b.score || 0) - Math.abs(a.score || 0));
+    const zeroSymbols = allSymbols.filter(s => (s.score || 0) === 0).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    const recipientsHtml = (data.recipients || []).map(r =>
+        `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
+            <span class="font-medium uppercase text-[10px] ${r.type === 'smtp' ? 'text-blue-500' : 'text-gray-400'}">${escapeHtml(r.type)}</span>
+            ${copyableText(r.address)}
+        </span>`
+    ).join(' ');
+
+    const scoreColor = (data.score || 0) >= 15 ? 'text-red-600 dark:text-red-400' :
+                       (data.score || 0) >= 6 ? 'text-orange-500 dark:text-orange-400' :
+                       'text-green-600 dark:text-green-400';
+
+    const buildSymbolRows = (syms) => syms.map(s => {
+        const sc = s.score || 0;
+        const cls = sc > 0 ? 'text-red-600 dark:text-red-400 font-semibold' :
+                    sc < 0 ? 'text-green-600 dark:text-green-400 font-semibold' :
+                    'text-gray-400 dark:text-gray-500';
+        const opts = (s.options || []).join(', ');
+        return `<tr class="border-b border-gray-100 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-700/30">
+            <td class="py-1.5 px-2 font-mono text-gray-800 dark:text-gray-200">${escapeHtml(s.name || '')}</td>
+            <td class="py-1.5 px-2 text-gray-500 dark:text-gray-400">${escapeHtml(s.group || '')}</td>
+            <td class="py-1.5 px-2 text-right ${cls}">${sc !== 0 ? (sc > 0 ? '+' : '') + sc.toFixed(2) : '0'}</td>
+            <td class="py-1.5 px-2 text-gray-400 dark:text-gray-500 max-w-xs truncate" title="${escapeHtml(opts)}">${escapeHtml(opts)}</td>
+        </tr>`;
+    }).join('');
+
+    const symbolTableHead = `<table class="w-full text-xs"><thead><tr class="border-b border-gray-200 dark:border-gray-700 text-left">
+        <th class="py-2 px-2 font-medium text-gray-500 dark:text-gray-400">Symbol</th>
+        <th class="py-2 px-2 font-medium text-gray-500 dark:text-gray-400">Group</th>
+        <th class="py-2 px-2 font-medium text-gray-500 dark:text-gray-400 text-right">Score</th>
+        <th class="py-2 px-2 font-medium text-gray-500 dark:text-gray-400">Details</th>
+    </tr></thead>`;
+
+    const textContent = data.text_plain || data.text_html || '';
+    const canAct = mailcowRwConfigured;
+
+    content.innerHTML = `
+        <div class="space-y-5">
+            <div class="space-y-3">
+                <div>
+                    <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Subject</label>
+                    <p class="text-sm font-medium text-gray-900 dark:text-white mt-0.5">${copyableText(data.subject || '-')}</p>
+                </div>
+                <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                        <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">From (Header)</label>
+                        <p class="text-sm text-gray-800 dark:text-gray-200 mt-0.5">${copyableText(data.header_from || '-')}</p>
+                    </div>
+                    <div>
+                        <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Envelope From</label>
+                        <p class="text-sm text-gray-800 dark:text-gray-200 mt-0.5 font-mono">${copyableText(data.env_from || '-')}</p>
+                    </div>
+                </div>
+                <div>
+                    <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Recipients</label>
+                    <div class="flex flex-wrap gap-1 mt-1">${recipientsHtml || '<span class="text-sm text-gray-500">-</span>'}</div>
+                </div>
+                <div class="flex items-center gap-4">
+                    <div>
+                        <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Score</label>
+                        <p class="text-lg font-bold ${scoreColor} mt-0.5">${(data.score || 0).toFixed(2)}</p>
+                    </div>
+                    <div>
+                        <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Action</label>
+                        <p class="mt-0.5"><span class="inline-block px-2 py-0.5 text-xs font-medium rounded bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-300">${escapeHtml(data.action || '-')}</span></p>
+                    </div>
+                </div>
+            </div>
+
+            <div>
+                <h4 class="text-sm font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
+                    <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"></path></svg>
+                    Rspamd Symbols
+                </h4>
+                ${activeSymbols.length > 0 ? `<div class="overflow-x-auto">${symbolTableHead}<tbody>${buildSymbolRows(activeSymbols)}</tbody></table></div>` : '<p class="text-gray-500 text-sm">No active symbols</p>'}
+                ${zeroSymbols.length > 0 ? `
+                <details class="mt-2">
+                    <summary class="text-xs text-gray-500 dark:text-gray-400 cursor-pointer hover:text-gray-700 dark:hover:text-gray-300 select-none py-1">
+                        Informational symbols (score 0) — ${zeroSymbols.length} items
+                    </summary>
+                    <div class="overflow-x-auto mt-1">${symbolTableHead}<tbody>${buildSymbolRows(zeroSymbols)}</tbody></table></div>
+                </details>` : ''}
+            </div>
+
+            ${textContent ? `
+            <div>
+                <h4 class="text-sm font-semibold text-gray-900 dark:text-white mb-2 flex items-center gap-2">
+                    <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+                    Email Content
+                </h4>
+                <pre class="text-xs bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap max-h-64 overflow-y-auto text-gray-800 dark:text-gray-200">${escapeHtml(textContent)}</pre>
+            </div>` : ''}
+
+            ${data.fuzzy_hashes && data.fuzzy_hashes.length > 0 ? `
+            <div>
+                <h4 class="text-sm font-semibold text-gray-900 dark:text-white mb-2">Fuzzy Hashes</h4>
+                <div class="text-xs font-mono bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-lg p-3">${data.fuzzy_hashes.map(h => escapeHtml(JSON.stringify(h))).join('<br>')}</div>
+            </div>` : ''}
+        </div>
+    `;
+
+    // Render sticky footer with action buttons
+    if (footer && canAct) {
+        footer.className = 'grid grid-cols-4 gap-1.5 p-3 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/50';
+        footer.innerHTML = `
+            <button onclick="closeQuarantineDetails(); quarantineRelease('${itemId}')"
+                class="py-2 text-xs font-medium rounded-md bg-green-500 text-white hover:bg-green-600 transition-colors flex items-center justify-center gap-1">
+                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                Release
+            </button>
+            <button onclick="closeQuarantineDetails(); quarantineDelete('${itemId}')"
+                class="py-2 text-xs font-medium rounded-md bg-red-500 text-white hover:bg-red-600 transition-colors flex items-center justify-center gap-1">
+                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                Delete
+            </button>
+            <button onclick="closeQuarantineDetails(); quarantineLearnHam('${itemId}')"
+                class="py-2 text-xs font-medium rounded-md bg-emerald-500 text-white hover:bg-emerald-600 transition-colors flex items-center justify-center gap-1">
+                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
+                Not Spam
+            </button>
+            <button onclick="closeQuarantineDetails(); quarantineLearnSpam('${itemId}')"
+                class="py-2 text-xs font-medium rounded-md bg-orange-500 text-white hover:bg-orange-600 transition-colors flex items-center justify-center gap-1">
+                <svg class="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"></path></svg>
+                Spam
+            </button>
+        `;
+    }
+}
+
+// =============================================================================
+// QUARANTINE AUTO-RULES
+// =============================================================================
+
+let _quarantineRulesCache = null;
+
+async function initQuarantineRules() {
+    const section = document.getElementById('quarantine-rules-section');
+    if (!section) return;
+    
+    // Ensure RW status is loaded (may not be ready on first page load)
+    if (!mailcowRwConfigured) {
+        await fetchRwStatus();
+    }
+    
+    if (mailcowRwConfigured) {
+        section.classList.remove('hidden');
+        loadQuarantineRules();
+    }
+}
+
+async function loadQuarantineRules() {
+    const container = document.getElementById('quarantine-rules-list');
+    if (!container) return;
+    
+    try {
+        const res = await authenticatedFetch('/api/quarantine/rules');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        _quarantineRulesCache = data;
+        
+        const countEl = document.getElementById('quarantine-rules-count');
+        const activeCount = data.data.filter(r => r.enabled).length;
+        if (countEl) countEl.textContent = activeCount > 0 ? `(${activeCount} active)` : '';
+        
+        if (!data.data || data.data.length === 0) {
+            container.innerHTML = '<p class="text-gray-500 dark:text-gray-400 text-center py-4 text-sm">No rules configured. Click "Add Rule" to create one.</p>';
+            return;
+        }
+        
+        container.innerHTML = data.data.map(rule => {
+            const matchLabels = { sender: 'Sender', sender_domain: 'Sender Domain', recipient: 'Recipient', subject: 'Subject' };
+            const actionColor = rule.action === 'delete' ? 'red' : 'green';
+            const actionLabel = rule.action === 'delete' ? 'Delete' : 'Release';
+            
+            return `
+            <div class="border ${rule.enabled ? 'border-gray-200 dark:border-gray-700' : 'border-gray-100 dark:border-gray-800 opacity-60'} rounded-lg p-3 bg-white dark:bg-gray-800 hover:border-gray-300 dark:hover:border-gray-600 transition">
+                <div class="flex items-center justify-between gap-3">
+                    <div class="flex-1 min-w-0">
+                        <div class="flex items-center gap-2 mb-1 flex-wrap">
+                            <span class="font-medium text-sm text-gray-900 dark:text-white">${escapeHtml(rule.name)}</span>
+                            <span class="px-2 py-0.5 text-xs rounded-full bg-${actionColor}-100 dark:bg-${actionColor}-900/30 text-${actionColor}-700 dark:text-${actionColor}-300">${actionLabel}</span>
+                            ${rule.is_regex ? '<span class="px-2 py-0.5 text-xs rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300">Regex</span>' : ''}
+                            ${!rule.enabled ? '<span class="px-2 py-0.5 text-xs rounded-full bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400">Disabled</span>' : ''}
+                        </div>
+                        <p class="text-xs text-gray-500 dark:text-gray-400">
+                            <span class="font-medium">${matchLabels[rule.match_type] || rule.match_type}:</span> 
+                            <code class="bg-gray-100 dark:bg-gray-700 px-1 rounded">${escapeHtml(rule.match_value)}</code>
+                        </p>
+                        <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                            Hits: ${rule.hit_count}${rule.last_hit_at ? ' · Last: ' + formatTime(rule.last_hit_at) : ''}
+                            ${rule.notes ? ' · ' + escapeHtml(rule.notes) : ''}
+                        </p>
+                    </div>
+                    <div class="flex items-center gap-1 flex-shrink-0">
+                        <button onclick="toggleQuarantineRule(${rule.id})" title="${rule.enabled ? 'Click to disable this rule' : 'Click to enable this rule'}"
+                            class="px-2 py-1 text-xs rounded-md font-medium transition ${rule.enabled 
+                                ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 hover:bg-green-200 dark:hover:bg-green-900/50' 
+                                : 'bg-gray-100 dark:bg-gray-700 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600'}">
+                            ${rule.enabled ? 'Enabled' : 'Disabled'}
+                        </button>
+                        <button onclick="showEditQuarantineRuleModal(${rule.id})" title="Edit"
+                            class="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition text-gray-400 hover:text-blue-500">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg>
+                        </button>
+                        <button onclick="deleteQuarantineRule(${rule.id}, '${escapeHtml(rule.name)}')" title="Delete"
+                            class="p-1.5 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition text-gray-400 hover:text-red-500">
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>`;
+        }).join('');
+    } catch (err) {
+        console.error('Failed to load quarantine rules:', err);
+        container.innerHTML = `<p class="text-red-500 text-center py-4 text-sm">Failed to load rules: ${err.message}</p>`;
+    }
+}
+
+function showAddQuarantineRuleModal() {
+    _showQuarantineRuleModal(null, null);
+}
+
+function showEditQuarantineRuleModal(ruleId) {
+    const rule = _quarantineRulesCache?.data?.find(r => r.id === ruleId);
+    if (!rule) { showToast('Rule not found', 'error'); return; }
+    _showQuarantineRuleModal(rule, null);
+}
+
+function showAddRuleFromQuarantine(sender, recipient, subject) {
+    // Pre-fill with data from the quarantine email
+    const senderDomain = sender.includes('@') ? sender.split('@').pop() : '';
+    const prefill = { sender, recipient, subject, senderDomain };
+    _showQuarantineRuleModal(null, prefill);
+}
+
+function _showQuarantineRuleModal(rule, prefill) {
+    const isEdit = !!rule;
+    const title = isEdit ? 'Edit Rule' : 'Add Quarantine Rule';
+    
+    // Determine default values: edit mode uses rule data, prefill uses quarantine data
+    const defaultName = isEdit ? escapeHtml(rule.name) : (prefill ? `Rule for ${prefill.sender}` : '');
+    const defaultMatchType = isEdit ? rule.match_type : (prefill ? 'sender' : 'sender');
+    const defaultMatchValue = isEdit ? escapeHtml(rule.match_value) : (prefill ? escapeHtml(prefill.sender) : '');
+    const defaultAction = isEdit ? rule.action : 'release';
+    const defaultIsRegex = isEdit ? rule.is_regex : false;
+    const defaultNotes = isEdit && rule.notes ? escapeHtml(rule.notes) : '';
+    
+    // For pre-fill mode, provide quick-fill buttons for sender/domain/recipient
+    const prefillButtons = prefill ? `
+        <div class="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-3 mb-4">
+            <p class="text-xs font-medium text-blue-700 dark:text-blue-300 mb-2">Quick fill from email:</p>
+            <div class="flex flex-wrap gap-1.5">
+                <button type="button" onclick="qrulePrefill('sender', '${escapeHtml(prefill.sender)}')"
+                    class="px-2 py-1 text-xs rounded bg-blue-100 dark:bg-blue-800 text-blue-700 dark:text-blue-300 hover:bg-blue-200 dark:hover:bg-blue-700 transition">Sender: ${escapeHtml(prefill.sender)}</button>
+                ${prefill.senderDomain ? `<button type="button" onclick="qrulePrefill('sender_domain', '${escapeHtml(prefill.senderDomain)}')"
+                    class="px-2 py-1 text-xs rounded bg-blue-100 dark:bg-blue-800 text-blue-700 dark:text-blue-300 hover:bg-blue-200 dark:hover:bg-blue-700 transition">Domain: ${escapeHtml(prefill.senderDomain)}</button>` : ''}
+                <button type="button" onclick="qrulePrefill('recipient', '${escapeHtml(prefill.recipient)}')"
+                    class="px-2 py-1 text-xs rounded bg-blue-100 dark:bg-blue-800 text-blue-700 dark:text-blue-300 hover:bg-blue-200 dark:hover:bg-blue-700 transition">Recipient: ${escapeHtml(prefill.recipient)}</button>
+            </div>
+        </div>
+    ` : '';
+    
+    const html = `
+    <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" id="quarantine-rule-modal-overlay">
+        <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto">
+            <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-white">${title}</h3>
+                <button onclick="closeQuarantineRuleModal()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
+            </div>
+            <div class="p-6 space-y-4">
+                ${prefillButtons}
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Rule Name</label>
+                    <input type="text" id="qrule-name" value="${defaultName}" 
+                        class="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg" placeholder="e.g., Allow notifications from service X">
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Match Type</label>
+                        <select id="qrule-match-type" class="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg">
+                            <option value="sender" ${defaultMatchType === 'sender' ? 'selected' : ''}>Sender</option>
+                            <option value="sender_domain" ${defaultMatchType === 'sender_domain' ? 'selected' : ''}>Sender Domain</option>
+                            <option value="recipient" ${defaultMatchType === 'recipient' ? 'selected' : ''}>Recipient</option>
+                            <option value="subject" ${defaultMatchType === 'subject' ? 'selected' : ''}>Subject</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Action</label>
+                        <select id="qrule-action" class="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg">
+                            <option value="release" ${defaultAction === 'release' ? 'selected' : ''}>✅ Release</option>
+                            <option value="delete" ${defaultAction === 'delete' ? 'selected' : ''}>🗑️ Delete</option>
+                        </select>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Match Value</label>
+                    <input type="text" id="qrule-match-value" value="${defaultMatchValue}"
+                        class="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg font-mono" placeholder="e.g., noreply@example.com">
+                    <div class="mt-2">
+                        <label class="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Match Mode</label>
+                        <select id="qrule-match-mode" onchange="updateQRuleMatchHelp()" class="w-full px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg">
+                            <option value="exact" ${!defaultIsRegex ? 'selected' : ''}>Exact Match — matches the full value exactly</option>
+                            <option value="contains" ${defaultIsRegex && !(isEdit && rule.match_value.startsWith('^')) ? 'selected' : ''}>Contains — matches if value appears anywhere</option>
+                            <option value="regex" ${defaultIsRegex && isEdit && rule.match_value.startsWith('^') ? 'selected' : ''}>Regex (advanced) — custom regular expression</option>
+                        </select>
+                        <p id="qrule-match-help" class="text-xs text-gray-400 dark:text-gray-500 mt-1"></p>
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Notes (optional)</label>
+                    <textarea id="qrule-notes" rows="2" class="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 dark:bg-gray-700 dark:text-white rounded-lg" placeholder="Why this rule exists...">${defaultNotes}</textarea>
+                </div>
+                <div class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3">
+                    <p class="text-xs text-amber-700 dark:text-amber-300">
+                        <strong>Priority:</strong> Delete rules always take priority over Release rules. If both match, the email will be deleted.
+                    </p>
+                </div>
+            </div>
+            <div class="px-6 py-4 border-t border-gray-200 dark:border-gray-700 flex justify-end gap-2">
+                <button onclick="closeQuarantineRuleModal()" class="px-4 py-2 text-sm font-medium rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button onclick="saveQuarantineRule(${isEdit ? rule.id : 'null'})" class="px-4 py-2 text-sm font-medium rounded-lg bg-amber-500 hover:bg-amber-600 text-white transition">
+                    ${isEdit ? 'Save Changes' : 'Create Rule'}
+                </button>
+            </div>
+        </div>
+    </div>`;
+    
+    document.body.insertAdjacentHTML('beforeend', html);
+    updateQRuleMatchHelp();
+}
+
+function qrulePrefill(matchType, value) {
+    const typeEl = document.getElementById('qrule-match-type');
+    const valueEl = document.getElementById('qrule-match-value');
+    const nameEl = document.getElementById('qrule-name');
+    if (typeEl) typeEl.value = matchType;
+    if (valueEl) valueEl.value = value;
+    // Update rule name if it's still auto-generated
+    if (nameEl && nameEl.value.startsWith('Rule for ')) {
+        const labels = { sender: 'Sender', sender_domain: 'Domain', recipient: 'Recipient' };
+        nameEl.value = `${labels[matchType] || matchType}: ${value}`;
+    }
+}
+
+function updateQRuleMatchHelp() {
+    const mode = document.getElementById('qrule-match-mode')?.value;
+    const helpEl = document.getElementById('qrule-match-help');
+    if (!helpEl) return;
+    const hints = {
+        exact: 'Example: noreply@example.com — will only match this exact address',
+        contains: 'Example: example.com — will match any value containing "example.com"',
+        regex: 'Example: ^.*@(spam|junk)\\.com$ — advanced pattern matching'
+    };
+    helpEl.textContent = hints[mode] || '';
+}
+
+function closeQuarantineRuleModal() {
+    const overlay = document.getElementById('quarantine-rule-modal-overlay');
+    if (overlay) overlay.remove();
+}
+
+async function saveQuarantineRule(ruleId) {
+    const name = document.getElementById('qrule-name')?.value?.trim();
+    const matchType = document.getElementById('qrule-match-type')?.value;
+    let matchValue = document.getElementById('qrule-match-value')?.value?.trim();
+    const matchMode = document.getElementById('qrule-match-mode')?.value || 'exact';
+    const action = document.getElementById('qrule-action')?.value;
+    const notes = document.getElementById('qrule-notes')?.value?.trim() || null;
+    
+    if (!name) { showToast('Rule name is required', 'error'); return; }
+    if (!matchValue) { showToast('Match value is required', 'error'); return; }
+    
+    // Convert match mode to is_regex + match_value
+    let isRegex = false;
+    if (matchMode === 'contains') {
+        // Auto-wrap in regex for "contains" mode (escape special chars)
+        const escaped = matchValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        matchValue = escaped;
+        isRegex = true;
+    } else if (matchMode === 'regex') {
+        isRegex = true;
+    }
+    
+    const body = { name, match_type: matchType, match_value: matchValue, is_regex: isRegex, action, notes };
+    
+    try {
+        const isEdit = ruleId !== null;
+        const url = isEdit ? `/api/quarantine/rules/${ruleId}` : '/api/quarantine/rules';
+        const method = isEdit ? 'PUT' : 'POST';
+        
+        const res = await authenticatedFetch(url, {
+            method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body)
+        });
+        
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        
+        closeQuarantineRuleModal();
+        showToast(isEdit ? 'Rule updated' : 'Rule created', 'success');
+        await loadQuarantineRules();
+    } catch (err) {
+        showToast('Failed to save rule: ' + err.message, 'error');
+    }
+}
+
+async function deleteQuarantineRule(ruleId, ruleName) {
+    if (!await showConfirmModal({ title: 'Delete Rule', message: `Delete rule "${ruleName}"?`, confirmText: 'Delete', isDangerous: true })) return;
+    
+    try {
+        const res = await authenticatedFetch(`/api/quarantine/rules/${ruleId}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        
+        showToast('Rule deleted', 'success');
+        await loadQuarantineRules();
+    } catch (err) {
+        showToast('Failed to delete rule: ' + err.message, 'error');
+    }
+}
+
+async function toggleQuarantineRule(ruleId) {
+    try {
+        const res = await authenticatedFetch(`/api/quarantine/rules/${ruleId}/toggle`, { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        
+        const rule = await res.json();
+        showToast(`Rule ${rule.enabled ? 'enabled' : 'disabled'}`, 'success');
+        await loadQuarantineRules();
+    } catch (err) {
+        showToast('Failed to toggle rule: ' + err.message, 'error');
+    }
+}
+
+async function testQuarantineRules() {
+    try {
+        showToast('Testing rules against quarantine...', 'info');
+        const res = await authenticatedFetch('/api/quarantine/rules/test', { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        
+        const data = await res.json();
+        
+        if (data.total_matches === 0) {
+            showToast(`No matches found (${data.total_quarantine} quarantine items checked)`, 'info');
+            return;
+        }
+        
+        // Group matches by rule
+        const byRule = {};
+        for (const m of data.matches) {
+            const key = m.rule_id;
+            if (!byRule[key]) {
+                byRule[key] = { rule_name: m.rule_name, action: m.action, rule_enabled: m.rule_enabled, items: [] };
+            }
+            byRule[key].items.push(m);
+        }
+        
+        const groupsHtml = Object.values(byRule).map(group => {
+            const actionColor = group.action === 'delete' ? 'red' : 'green';
+            const itemsHtml = group.items.map(m => `
+                <div class="py-1.5 pl-3 border-l-2 ${group.rule_enabled ? 'border-' + actionColor + '-300 dark:border-' + actionColor + '-700' : 'border-gray-300 dark:border-gray-600'}">
+                    <div class="text-xs text-gray-700 dark:text-gray-300">${escapeHtml(m.sender || '?')} → ${escapeHtml(m.recipient || '?')}</div>
+                    <div class="text-xs text-gray-400 dark:text-gray-500 truncate" title="${escapeHtml(m.subject || '')}">${escapeHtml((m.subject || 'No subject').substring(0, 80))}</div>
+                </div>
+            `).join('');
+            
+            return `
+            <div class="mb-4 ${!group.rule_enabled ? 'opacity-50' : ''}">
+                <div class="flex items-center gap-2 mb-1.5 flex-wrap">
+                    <span class="font-medium text-sm text-gray-900 dark:text-white">${escapeHtml(group.rule_name)}</span>
+                    <span class="px-1.5 py-0.5 text-xs rounded bg-${actionColor}-100 dark:bg-${actionColor}-900/30 text-${actionColor}-700 dark:text-${actionColor}-300">${group.action}</span>
+                    ${!group.rule_enabled ? '<span class="px-1.5 py-0.5 text-xs rounded bg-gray-200 dark:bg-gray-700 text-gray-500 dark:text-gray-400">Disabled — will not execute</span>' : ''}
+                    <span class="text-xs text-gray-400 ml-auto">${group.items.length} match${group.items.length !== 1 ? 'es' : ''}</span>
+                </div>
+                <div class="space-y-1">${itemsHtml}</div>
+            </div>`;
+        }).join('');
+        
+        const disabledCount = data.matches.filter(m => !m.rule_enabled).length;
+        const activeCount = data.matches.length - disabledCount;
+        const noMatches = data.total_matches === 0;
+        
+        const html = `
+        <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" id="qrule-test-modal">
+            <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-lg max-h-[80vh] overflow-y-auto">
+                <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+                    <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Test Results</h3>
+                    <button onclick="document.getElementById('qrule-test-modal').remove()" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                    </button>
+                </div>
+                <div class="p-6">
+                    <div class="flex items-center gap-3 mb-4 pb-3 border-b border-gray-100 dark:border-gray-700">
+                        <div class="text-center">
+                            <div class="text-2xl font-bold text-gray-900 dark:text-white">${data.total_matches}</div>
+                            <div class="text-xs text-gray-500">matched</div>
+                        </div>
+                        <div class="text-center text-gray-300 dark:text-gray-600">/</div>
+                        <div class="text-center">
+                            <div class="text-2xl font-bold text-gray-400">${data.total_quarantine}</div>
+                            <div class="text-xs text-gray-500">total</div>
+                        </div>
+                        ${disabledCount > 0 ? `<div class="ml-auto text-xs text-amber-600 dark:text-amber-400">⚠ ${disabledCount} from disabled rules</div>` : ''}
+                    </div>
+                    ${noMatches ? '<p class="text-sm text-gray-500 text-center py-4">No quarantine items matched any rules.</p>' : groupsHtml}
+                    <p class="text-xs text-gray-400 dark:text-gray-500 mt-4 pt-3 border-t border-gray-100 dark:border-gray-700 text-center">This is a dry-run preview. No actions were taken.</p>
+                </div>
+            </div>
+        </div>`;
+        document.body.insertAdjacentHTML('beforeend', html);
+    } catch (err) {
+        showToast('Test failed: ' + err.message, 'error');
+    }
+}
+
+function toggleQuarantineRuleHistory() {
+    const section = document.getElementById('quarantine-rules-history');
+    if (!section) return;
+    
+    if (section.classList.contains('hidden')) {
+        section.classList.remove('hidden');
+        loadQuarantineRuleHistory();
+    } else {
+        section.classList.add('hidden');
+    }
+}
+
+async function loadQuarantineRuleHistory() {
+    const container = document.getElementById('quarantine-rules-history-list');
+    if (!container) return;
+    
+    container.innerHTML = '<p class="text-gray-400 text-xs text-center py-2">Loading...</p>';
+    
+    try {
+        const res = await authenticatedFetch('/api/quarantine/rules/logs?limit=20');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        
+        if (!data.data || data.data.length === 0) {
+            container.innerHTML = '<p class="text-gray-400 text-xs text-center py-2">No actions recorded yet</p>';
+            return;
+        }
+        
+        container.innerHTML = data.data.map(log => `
+            <div class="flex items-center gap-2 py-1.5 border-b border-gray-100 dark:border-gray-700/50 text-xs">
+                <span class="px-1.5 py-0.5 rounded ${log.action === 'delete' ? 'bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400' : 'bg-green-100 dark:bg-green-900/30 text-green-600 dark:text-green-400'}">${log.action}</span>
+                <span class="text-gray-500 dark:text-gray-400 flex-1 truncate" title="${escapeHtml(log.sender || '')} → ${escapeHtml(log.recipient || '')}">
+                    ${escapeHtml(log.sender || '?')} → ${escapeHtml(log.recipient || '?')}
+                </span>
+                <span class="text-gray-400 dark:text-gray-500 flex-shrink-0" title="Rule: ${escapeHtml(log.rule_name || '')}">${formatTime(log.created_at)}</span>
+            </div>
+        `).join('');
+    } catch (err) {
+        container.innerHTML = `<p class="text-red-500 text-xs text-center py-2">Failed: ${err.message}</p>`;
     }
 }
 
@@ -3127,7 +3963,7 @@ async function loadMessages(page = 1) {
                             </div>
                         </div>
                         <div class="flex flex-wrap items-center gap-4 text-xs text-gray-500 dark:text-gray-400">
-                            <span>${formatTime(msg.last_seen)}</span>
+                            <span>${formatTime(msg.first_seen)}</span>
                             ${msg.queue_id ? `<span class="font-mono" title="Queue ID">Q: ${msg.queue_id}</span>` : ''}
                             ${msg.message_id ? `<span class="font-mono truncate max-w-xs" title="Message ID: ${escapeHtml(msg.message_id)}">MID: ${escapeHtml(msg.message_id.substring(0, 20))}${msg.message_id.length > 20 ? '...' : ''}</span>` : ''}
                             ${msg.spam_score !== null ? `<span>Score: <span class="${msg.spam_score >= 15 ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-gray-600 dark:text-gray-300'}">${msg.spam_score.toFixed(1)}</span></span>` : ''}
@@ -4040,11 +4876,32 @@ function renderStatusJobs(jobs) {
                 ['Fetch Raw Logs', 'fetch_raw_logs', jobs.fetch_raw_logs],
                 ['Cleanup Raw Logs', 'cleanup_raw_logs', jobs.cleanup_raw_logs]
             ]
+        },
+        {
+            title: 'Spam Filter',
+            icon: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"></path>',
+            jobs: [
+                ['Detect Suppressions', 'detect_suppressions', jobs.detect_suppressions],
+                ['Sync to Rspamd', 'sync_suppressions', jobs.sync_suppressions],
+                ['Expire Suppressions', 'expire_suppressions', jobs.expire_suppressions],
+                ['Cleanup Deferred Queue', 'cleanup_deferred_queue', jobs.cleanup_deferred_queue]
+            ]
+        },
+        {
+            title: 'Quarantine',
+            icon: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.618 5.984A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01"></path>',
+            jobs: [
+                ['Process Quarantine Rules', 'process_quarantine_rules', jobs.process_quarantine_rules]
+            ]
         }
     ];
     
     let html = '';
     for (const cat of categories) {
+        // Skip categories where no jobs exist
+        const validJobs = cat.jobs.filter(j => j[2]);
+        if (validJobs.length === 0) continue;
+        
         html += `
             <div class="mb-6">
                 <div class="flex items-center gap-2 mb-3">
@@ -4259,6 +5116,12 @@ async function viewMessageDetails(correlationKey) {
 
         // Update Security tab indicator
         updateSecurityTabIndicator(data);
+
+        // Hide Security tab if netfilter feature is disabled
+        const netfilterTab = document.getElementById('modal-tab-netfilter');
+        if (netfilterTab) {
+            netfilterTab.style.display = window.disabledFeatures.includes('netfilter') ? 'none' : '';
+        }
 
         document.querySelectorAll('[id^="modal-tab-"]').forEach(btn => {
             btn.classList.remove('active');
@@ -6109,6 +6972,92 @@ function showBasicAuthVerifyModal() {
     });
 }
 
+/**
+ * Shows a confirmation modal when features are being disabled.
+ * Lists the features and warns about permanent data deletion.
+ * @param {string[]} featureIds - Array of feature IDs being newly disabled
+ * @returns {Promise<boolean>} true if confirmed, false if cancelled
+ */
+function showFeatureDisableConfirmModal(featureIds) {
+    return new Promise((resolve) => {
+        const existing = document.getElementById('feature-disable-confirm-modal');
+        if (existing) existing.remove();
+
+        // Build feature list HTML
+        const featureListHtml = featureIds.map(id => {
+            const feat = TOGGLEABLE_FEATURES.find(f => f.id === id);
+            return `<li style="padding:4px 0;color:#f3f4f6;font-size:14px;">
+                <span style="color:#ef4444;margin-right:6px;">✕</span>${feat ? feat.label : id}
+                <span style="color:#6b7280;font-size:12px;margin-left:4px;">— ${feat ? feat.description : ''}</span>
+            </li>`;
+        }).join('');
+
+        const overlay = document.createElement('div');
+        overlay.id = 'feature-disable-confirm-modal';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);';
+
+        overlay.innerHTML = `
+            <div style="background:var(--color-bg-primary, #1f2937);border:1px solid var(--color-border, #374151);border-radius:12px;padding:28px;max-width:520px;width:90%;box-shadow:0 25px 50px rgba(0,0,0,0.4);">
+                <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
+                    <div style="width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#ef4444,#dc2626);display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                        <svg width="20" height="20" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <h3 style="margin:0;font-size:16px;font-weight:600;color:#f3f4f6;">Disable ${featureIds.length === 1 ? 'Feature' : featureIds.length + ' Features'}?</h3>
+                        <p style="margin:4px 0 0;font-size:13px;color:#9ca3af;">This action will permanently delete stored data</p>
+                    </div>
+                </div>
+                <div style="background:#1c1917;border:1px solid #7f1d1d;border-radius:8px;padding:14px;margin-bottom:16px;">
+                    <p style="margin:0 0 8px;font-size:12px;color:#fca5a5;display:flex;align-items:center;gap:6px;font-weight:500;">
+                        <svg width="14" height="14" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"></path></svg>
+                        All database records for ${featureIds.length === 1 ? 'this feature' : 'these features'} will be permanently deleted. This cannot be undone.
+                    </p>
+                </div>
+                <div style="margin-bottom:20px;">
+                    <p style="margin:0 0 8px;font-size:13px;color:#9ca3af;font-weight:500;">Features being disabled:</p>
+                    <ul style="margin:0;padding:0 0 0 4px;list-style:none;">${featureListHtml}</ul>
+                </div>
+                <div style="display:flex;justify-content:flex-end;gap:10px;">
+                    <button type="button" id="feature-disable-cancel"
+                        style="padding:9px 18px;border-radius:6px;border:1px solid #4b5563;background:transparent;color:#d1d5db;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;"
+                        onmouseover="this.style.background='#374151'" onmouseout="this.style.background='transparent'">
+                        Cancel
+                    </button>
+                    <button type="button" id="feature-disable-confirm"
+                        style="padding:9px 18px;border-radius:6px;border:none;background:linear-gradient(135deg,#ef4444,#dc2626);color:white;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.15s;"
+                        onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='1'">
+                        Disable & Delete Data
+                    </button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        const cancelBtn = document.getElementById('feature-disable-cancel');
+        const confirmBtn = document.getElementById('feature-disable-confirm');
+
+        function cleanup() { overlay.remove(); }
+
+        cancelBtn.addEventListener('click', () => { cleanup(); resolve(false); });
+        confirmBtn.addEventListener('click', () => { cleanup(); resolve(true); });
+
+        overlay.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { e.preventDefault(); cleanup(); resolve(false); }
+            else if (e.key === 'Enter') { e.preventDefault(); cleanup(); resolve(true); }
+        });
+
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) { cleanup(); resolve(false); }
+        });
+
+        // Focus confirm button
+        setTimeout(() => confirmBtn.focus(), 100);
+    });
+}
+
 // Per-field descriptions (from env.example comments)
 var SETTINGS_FIELD_DESCRIPTIONS = {
     mailcow_url: 'Your mailcow instance URL (without trailing slash).',
@@ -6117,9 +7066,10 @@ var SETTINGS_FIELD_DESCRIPTIONS = {
     mailcow_api_timeout: 'API request timeout in seconds.',
     mailcow_api_verify_ssl: 'Verify SSL certificates when connecting to mailcow API. Set to false for development with self-signed certificates. Default: true.',
     fetch_interval: 'Seconds between log fetches from mailcow. Lower = more frequent updates, higher load. Default: 60.',
-    fetch_count_postfix: 'Postfix logs to fetch per request. Recommended: 500 for most servers; increase for high volume. Default: 2000.',
-    fetch_count_rspamd: 'Rspamd logs to fetch per request. Default: 500.',
+    fetch_count_postfix: 'Postfix logs to fetch per API request (page size for paginated fetching). The system paginates through all available logs until catching up. Default: 2000.',
+    fetch_count_rspamd: 'Rspamd logs to fetch per API request (page size for paginated fetching). The system paginates through all available logs until catching up. Default: 500.',
     fetch_count_netfilter: 'Netfilter logs to fetch per request. Default: 500.',
+    fetch_max_pages: 'Maximum number of pages to fetch per cycle for Postfix/Rspamd. Safety limit to prevent infinite loops. Total logs per cycle = page size × max pages. Default: 50.',
     retention_days: 'Days to keep logs in database. Older logs are automatically deleted. Recommended: 7 for most, 30 for compliance. Default: 7.',
     max_correlation_age_minutes: 'Stop searching for correlations older than this (minutes).',
     correlation_check_interval: 'Seconds between correlation completion checks. Default: 120.',
@@ -6179,11 +7129,40 @@ var SETTINGS_FIELD_DESCRIPTIONS = {
     dmarc_error_email: 'Email for DMARC error notifications (defaults to Admin email if not set).',
     maxmind_account_id: 'MaxMind Account ID for GeoIP database downloads. Required to download GeoLite2 databases.',
     maxmind_license_key: 'MaxMind License Key for GeoIP database downloads. Required to download GeoLite2 databases. Keep this secret.',
+    disabled_features: 'Disable features to hide their pages and stop their background jobs. Core features (Dashboard, Messages, Settings, Status) are always enabled.',
     raw_logs_enabled: 'Enable background raw log collection for the Logs page. When disabled, no logs are fetched and the Logs page shows historical data only.',
     raw_logs_fetch_interval: 'Seconds between raw log fetch cycles. Lower = more frequent updates. Default: 20.',
     raw_logs_fetch_count: 'Number of log entries to fetch per service per cycle. Higher values catch more logs but increase API load. Default: 1000.',
     raw_logs_retention_days: 'Days to keep raw logs in the database. Older logs are automatically deleted at 3:00 AM daily. Default: 2.',
-    raw_logs_services: 'Select which mailcow services to collect logs from. Unchecked services will not be fetched or displayed.'
+    raw_logs_services: 'Select which mailcow services to collect logs from. Unchecked services will not be fetched or displayed.',
+    rspamd_password: 'Rspamd UI/API password for reading Rspamd map data. Required to view and edit Rspamd maps.',
+    suppression_enabled: 'Master switch for the spam suppression system. When enabled, bounced/rejected recipients are automatically blocked from receiving future emails.',
+    suppression_auto_detect: 'Automatically scan Postfix logs to detect hard bounce (5.x.x) errors and add recipients to the suppression list.',
+    suppression_rspamd_sync: 'Sync the suppression list to Rspamd\'s global_rcpt_blacklist.map so blocked emails are rejected at SMTP level. Requires Rspamd password.',
+    suppression_whitelist_domains: 'Domains listed here will never be suppressed, even if they bounce. Comma-separated (e.g., gmail.com, outlook.com).',
+    suppression_hard_bounce_action: 'What to do when a permanent delivery failure (5.x.x) is detected.',
+    suppression_soft_bounce_action: 'What to do when a temporary delivery failure (4.x.x) is detected in Postfix logs. Note: deferred emails stuck in the queue are handled separately by Queue Cleanup below.',
+    suppression_soft_bounce_threshold: 'How many soft bounces from Postfix logs before the recipient is suppressed (only applies when action is "Count then suppress").',
+    suppression_base_expiry_days: 'How long to block a recipient. Multiplied by bounce count for repeat offenders (e.g., 7 days × 3 bounces = 21 days). Used by all suppression types. Default: 7.',
+    suppression_max_expiry_days: 'Maximum block duration cap, regardless of bounce count. Default: 90.',
+    quarantine_rules_max_actions: 'Safety limit: maximum emails to release/delete per scheduler run. Prevents accidental mass-processing from overly broad rules. Default: 50.',
+    quarantine_rules_interval: 'Minutes between quarantine rule processing runs. Lower = faster response to new quarantine items, higher = less API load on mailcow. Default: 5.',
+    quarantine_rules_log_retention_days: 'Days to keep quarantine auto-rule action history. Older action logs are automatically cleaned up. Default: 30.',
+    queue_cleanup_enabled: 'Automatically monitor the mail queue for deferred emails. If an email has been stuck longer than the threshold, it is deleted from the queue and the recipient is suppressed.',
+    queue_cleanup_threshold_minutes: 'How long (in minutes) a deferred email must be stuck in the queue before it is automatically deleted and the recipient suppressed. Default: 60 (1 hour).'
+};
+
+// Predefined options for settings fields (renders as dropdown instead of text input)
+const SETTINGS_FIELD_OPTIONS = {
+    suppression_hard_bounce_action: [
+        { value: 'suppress', label: 'Suppress — block the recipient immediately' },
+        { value: 'ignore', label: 'Ignore — do nothing' }
+    ],
+    suppression_soft_bounce_action: [
+        { value: 'suppress', label: 'Suppress — block immediately on first soft bounce' },
+        { value: 'count', label: 'Count then suppress — block after reaching threshold' },
+        { value: 'ignore', label: 'Ignore — do nothing (let Postfix retry)' }
+    ]
 };
 
 // Edit form tabs (same order as env.example sections) with descriptions from env.example
@@ -6199,6 +7178,7 @@ var SETTINGS_EDIT_TABS = [
         id: 'fetch', label: 'Fetch', description: 'How often to fetch logs from mailcow and how many records per request. Lower interval = more frequent updates, higher load. Retention: how many days to keep logs in the database (older logs are deleted).', groups: [
             { label: 'Timing', keys: ['fetch_interval'] },
             { label: 'Counts per Request', keys: ['fetch_count_postfix', 'fetch_count_rspamd', 'fetch_count_netfilter'] },
+            { label: 'Pagination', keys: ['fetch_max_pages'] },
             { label: 'Retention', keys: ['retention_days'] }
         ]
     },
@@ -6211,7 +7191,8 @@ var SETTINGS_EDIT_TABS = [
         id: 'application', label: 'Application', description: 'Web app port, title and logo. Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL. Debug mode shows detailed errors (do not enable in production). Search/CSV limits and scheduler worker count.', groups: [
             { label: 'Basic', keys: ['app_port', 'app_title', 'app_logo_url'] },
             { label: 'Logging', keys: ['log_level', 'debug'] },
-            { label: 'Limits', keys: ['max_search_results', 'csv_export_limit', 'scheduler_workers'] }
+            { label: 'Limits', keys: ['max_search_results', 'csv_export_limit', 'scheduler_workers'] },
+            { label: 'Features', keys: ['disabled_features'] }
         ]
     },
     {
@@ -6275,10 +7256,73 @@ var SETTINGS_EDIT_TABS = [
             { label: 'Retention', keys: ['raw_logs_retention_days'] },
             { label: 'Services', keys: ['raw_logs_services'] }
         ]
+    },
+    {
+        id: 'spam_filter', label: 'Spam Filter', description: 'Automatic bounce handling and Rspamd integration. Hard bounces are detected from Postfix logs. Deferred (soft bounce) emails are detected directly in the mail queue. Suppression block duration grows with each repeat bounce.', groups: [
+            { label: 'Rspamd', keys: ['rspamd_password'] },
+            { label: 'Suppression', keys: ['suppression_enabled', 'suppression_auto_detect', 'suppression_rspamd_sync'] },
+            { label: 'Hard Bounces (5.x.x)', keys: ['suppression_hard_bounce_action'] },
+            { label: 'Soft Bounces (4.x.x) — Log Detection', keys: ['suppression_soft_bounce_action', 'suppression_soft_bounce_threshold'] },
+            { label: 'Deferred Queue Cleanup', keys: ['queue_cleanup_enabled', 'queue_cleanup_threshold_minutes'] },
+            { label: 'Block Duration', keys: ['suppression_base_expiry_days', 'suppression_max_expiry_days'] },
+            { label: 'Whitelist', keys: ['suppression_whitelist_domains'] }
+        ]
+    },
+    {
+        id: 'quarantine', label: 'Quarantine', description: 'Quarantine auto-rules settings. Rules automatically release or delete quarantined emails based on sender, domain, recipient, or subject patterns. Requires a Read-Write API key.', groups: [
+            { label: 'Auto-Rules Scheduler', keys: ['quarantine_rules_max_actions', 'quarantine_rules_interval', 'quarantine_rules_log_retention_days'] }
+        ]
     }
 ];
 
 function renderSettingsEditField(key, value, sensitiveKeys, description, envLocked, defaultValue) {
+    // Special renderer for disabled_features — checkboxes for feature toggles
+    if (key === 'disabled_features') {
+        const disabledSet = new Set(
+            (value || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+        );
+        const isLocked = envLocked;
+        
+        let html = `<div class="mb-2">
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Feature Toggles</label>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">Uncheck features to hide them from the UI and stop their background jobs. <span class="text-red-500 dark:text-red-400 font-medium">Disabling a feature permanently deletes its stored data.</span></p>`;
+        
+        if (isLocked) {
+            html += `<div class="text-xs text-amber-600 dark:text-amber-400 mb-2 flex items-center gap-1">
+                <svg class="w-3 h-3" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"/></svg>
+                Locked by ENV (DISABLED_FEATURES)
+            </div>`;
+        }
+        
+        html += `<div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">`;
+        
+        for (const feature of TOGGLEABLE_FEATURES) {
+            const isEnabled = !disabledSet.has(feature.id);
+            const checkedAttr = isEnabled ? 'checked' : '';
+            const disabledAttr = isLocked ? 'disabled' : '';
+            
+            html += `<label class="flex items-start gap-2 p-2 rounded-lg border cursor-pointer transition-all
+                ${isEnabled 
+                    ? 'border-green-200 dark:border-green-700/50 bg-green-50/50 dark:bg-green-900/10' 
+                    : 'border-gray-200 dark:border-gray-700 bg-gray-50/50 dark:bg-gray-800/50 opacity-60'}
+                ${isLocked ? 'cursor-not-allowed' : 'hover:border-blue-300 dark:hover:border-blue-600'}">
+                <input type="checkbox" ${checkedAttr} ${disabledAttr}
+                    class="mt-0.5 rounded border-gray-300 dark:border-gray-600 text-blue-600 focus:ring-blue-500"
+                    onchange="updateDisabledFeaturesCheckbox('${feature.id}', this.checked, this)">
+                <div>
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">${feature.label}</div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">${feature.description}</div>
+                </div>
+            </label>`;
+        }
+        
+        html += `</div>
+            <input type="hidden" id="setting-disabled_features" name="disabled_features" value="${value || ''}">
+        </div>`;
+        
+        return html;
+    }
+
     // Special renderer for raw_logs_services — checkboxes
     if (key === 'raw_logs_services') {
         const ALL_LOG_SERVICES = [
@@ -6384,6 +7428,24 @@ function renderSettingsEditField(key, value, sensitiveKeys, description, envLock
             '<div><label for="edit-' + key + '" class="text-sm font-medium text-gray-700 dark:text-gray-300">' + escapeHtml(label) + labelLockIcon + '</label>' + descHtml + envLockedHtml + '</div></div>' +
             clearBtnHtml + '</div>';
     }
+
+    // Dropdown for fields with predefined options
+    const fieldOptions = SETTINGS_FIELD_OPTIONS[key];
+    if (fieldOptions) {
+        let optionsHtml = '';
+        fieldOptions.forEach(function(opt) {
+            const selected = String(displayVal) === opt.value ? 'selected' : '';
+            optionsHtml += '<option value="' + escapeHtml(opt.value) + '" ' + selected + '>' + escapeHtml(opt.label) + '</option>';
+        });
+        return '<div class="' + (envLocked ? 'opacity-60' : '') + '"><label for="edit-' + key + '" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">' + escapeHtml(label) + labelLockIcon + '</label>' +
+            descHtml +
+            '<select id="edit-' + key + '" name="' + key + '" ' + disabledAttr + ' ' +
+            'class="w-full rounded border ' + (envLocked ? 'border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-gray-400 dark:text-gray-500 cursor-not-allowed' : (changedBorder ? changedBorder + ' bg-white dark:bg-gray-700 text-gray-900 dark:text-white' : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white')) + ' px-3 py-2 text-sm">' +
+            optionsHtml + '</select>' +
+            clearBtnHtml +
+            envLockedHtml + '</div>';
+    }
+
     const inputType = sensitive ? 'password' : (isNum ? 'number' : 'text');
     const placeholder = envLocked ? 'Controlled by ENV' : '';
     const valAttr = (isBool ? '' : displayVal);
@@ -6797,6 +7859,10 @@ function renderSettings(content, data) {
                         <p class="text-sm text-gray-900 dark:text-white mt-1">${config.fetch_count_netfilter || config.fetch_count || 0} per request</p>
                     </div>
                     <div class="p-3 bg-gray-50 dark:bg-gray-700/30 rounded-lg">
+                        <p class="text-xs font-medium text-gray-500 dark:text-gray-400">Max Pages per Cycle</p>
+                        <p class="text-sm text-gray-900 dark:text-white mt-1">${config.fetch_max_pages || 50}</p>
+                    </div>
+                    <div class="p-3 bg-gray-50 dark:bg-gray-700/30 rounded-lg">
                         <p class="text-xs font-medium text-gray-500 dark:text-gray-400">Retention</p>
                         <p class="text-sm text-gray-900 dark:text-white mt-1">${config.retention_days || 0} days</p>
                     </div>
@@ -6826,9 +7892,10 @@ function renderSettings(content, data) {
                     </div>
                     <div class="p-3 bg-gray-50 dark:bg-gray-700/30 rounded-lg">
                         <p class="text-xs font-medium text-gray-500 dark:text-gray-400">MaxMind Status</p>
-                        <p class="text-sm text-gray-900 dark:text-white mt-1">
+                        <div class="flex flex-wrap items-center gap-1 mt-1">
                             ${renderMaxMindStatus(data.configuration.maxmind_status)}
-                        </p>
+                            ${data.geoip_configuration ? renderGeoIPDbStatus(data.geoip_configuration) : ''}
+                        </div>
                     </div>
                     ` : ''}
                 </div>
@@ -6843,8 +7910,23 @@ function renderSettings(content, data) {
             const configKeys = Object.keys(data.editable_config);
             const otherKeys = configKeys.filter(function (k) { return !allAssignedKeys.has(k); });
             const tabs = otherKeys.length ? SETTINGS_EDIT_TABS.concat([{ id: 'other', label: 'Other', groups: [{ label: 'Settings', keys: otherKeys }] }]) : SETTINGS_EDIT_TABS;
+
+            // Map settings tabs to features — hide tabs for disabled features
+            const SETTINGS_TAB_FEATURE_MAP = {
+                'dmarc': 'dmarc',
+                'dmarc_imap': 'dmarc',
+                'logs': 'logs',
+                'spam_filter': 'spam-filter',
+                'quarantine': 'quarantine'
+            };
+            const filteredTabs = tabs.filter(function (tab) {
+                const feature = SETTINGS_TAB_FEATURE_MAP[tab.id];
+                if (feature && window.disabledFeatures && window.disabledFeatures.includes(feature)) return false;
+                return true;
+            });
+
             let tabsHtml = '<div class="flex flex-wrap gap-1 border-b border-gray-200 dark:border-gray-700 mb-4">';
-            tabs.forEach(function (tab, idx) {
+            filteredTabs.forEach(function (tab, idx) {
                 const allKeysInTab = (tab.groups || []).flatMap(function (g) { return g.keys; });
                 const keysInTab = allKeysInTab.filter(function (k) { return data.editable_config[k] !== undefined; });
                 if (keysInTab.length === 0 && tab.id !== 'maxmind') return;
@@ -6852,7 +7934,7 @@ function renderSettings(content, data) {
                 tabsHtml += '<button type="button" class="settings-edit-tab px-3 py-2 text-sm font-medium rounded-t border-b-2 border-transparent' + active + '" data-tab="' + tab.id + '">' + escapeHtml(tab.label) + '</button>';
             });
             tabsHtml += '</div><div class="space-y-6">';
-            tabs.forEach(function (tab, idx) {
+            filteredTabs.forEach(function (tab, idx) {
                 const allKeysInTab = (tab.groups || []).flatMap(function (g) { return g.keys; });
                 const keysInTab = allKeysInTab.filter(function (k) { return data.editable_config[k] !== undefined; });
                 // Show tab if it has keys OR if it's maxmind tab (which shows status)
@@ -6891,8 +7973,48 @@ function renderSettings(content, data) {
 
                 // Special handling for MaxMind tab
                 if (tab.id === 'maxmind') {
-                    tabsHtml += '<div class="mb-6 p-4 bg-gray-50 dark:bg-gray-700/30 rounded-lg"><h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Status</h4><div class="p-4 bg-white dark:bg-gray-800 rounded-lg">';
-                    tabsHtml += '<p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">MaxMind Status</p><p class="text-sm text-gray-900 dark:text-white mt-1">' + renderMaxMindStatus(data.configuration.maxmind_status) + '</p></div></div>';
+                    const geoipCfg = data.geoip_configuration || {};
+                    const dbs = geoipCfg.databases || {};
+                    const cityDb = dbs.City || {};
+                    const asnDb = dbs.ASN || {};
+                    
+                    tabsHtml += '<div class="mb-6 p-4 bg-gray-50 dark:bg-gray-700/30 rounded-lg"><h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Status</h4>';
+                    tabsHtml += '<div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">';
+                    
+                    // License Status
+                    tabsHtml += '<div class="p-4 bg-white dark:bg-gray-800 rounded-lg">';
+                    tabsHtml += '<p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">License</p>';
+                    tabsHtml += '<div class="flex items-center gap-2">' + renderMaxMindStatus(data.configuration.maxmind_status) + '</div>';
+                    tabsHtml += '</div>';
+                    
+                    // DB Health
+                    tabsHtml += '<div class="p-4 bg-white dark:bg-gray-800 rounded-lg">';
+                    tabsHtml += '<p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">Database Health</p>';
+                    tabsHtml += '<div id="geoip-db-status" class="flex items-center gap-2">' + renderGeoIPDbStatus(geoipCfg) + '</div>';
+                    tabsHtml += '</div>';
+                    
+                    // Databases (City + ASN combined)
+                    tabsHtml += '<div class="p-4 bg-white dark:bg-gray-800 rounded-lg">';
+                    tabsHtml += '<p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">Databases</p>';
+                    if (cityDb.available || asnDb.available) {
+                        tabsHtml += '<div class="space-y-1">';
+                        if (cityDb.available) {
+                            tabsHtml += '<p class="text-sm text-gray-900 dark:text-white">City: ' + cityDb.size_mb + 'MB <span class="text-xs text-gray-500">(' + cityDb.age_days + 'd old)</span></p>';
+                        } else {
+                            tabsHtml += '<p class="text-sm text-gray-500 dark:text-gray-400">City: Not installed</p>';
+                        }
+                        if (asnDb.available) {
+                            tabsHtml += '<p class="text-sm text-gray-900 dark:text-white">ASN: ' + asnDb.size_mb + 'MB <span class="text-xs text-gray-500">(' + asnDb.age_days + 'd old)</span></p>';
+                        } else {
+                            tabsHtml += '<p class="text-sm text-gray-500 dark:text-gray-400">ASN: Not installed</p>';
+                        }
+                        tabsHtml += '</div>';
+                    } else {
+                        tabsHtml += '<p class="text-sm text-gray-500 dark:text-gray-400">Not installed</p>';
+                    }
+                    tabsHtml += '</div>';
+                    
+                    tabsHtml += '</div></div>';
                 }
 
                 (tab.groups || []).forEach(function (group) {
@@ -7283,6 +8405,28 @@ function renderSettings(content, data) {
                 }
                 // ──────────────────────────────────────────────────────────
 
+                // ── Feature disable confirmation ─────────────────────────
+                // Detect if any features are being newly disabled
+                const PURGEABLE_FEATURES = ['netfilter', 'domains', 'dmarc', 'mailbox-stats', 'logs', 'blacklist', 'spam-filter', 'quarantine'];
+                let newlyDisabledFeatures = [];
+                if ('disabled_features' in payload) {
+                    const oldDisabled = new Set(
+                        (window.disabledFeatures || []).map(s => s.trim().toLowerCase())
+                    );
+                    const newDisabled = new Set(
+                        (payload.disabled_features || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+                    );
+                    newlyDisabledFeatures = [...newDisabled].filter(f => !oldDisabled.has(f));
+
+                    // Show confirmation modal if any purgeable features are being disabled
+                    const purgeableNewlyDisabled = newlyDisabledFeatures.filter(f => PURGEABLE_FEATURES.includes(f));
+                    if (purgeableNewlyDisabled.length > 0) {
+                        const confirmed = await showFeatureDisableConfirmModal(purgeableNewlyDisabled);
+                        if (!confirmed) return; // User cancelled
+                    }
+                }
+                // ──────────────────────────────────────────────────────────
+
                 try {
                     const saveBtn = content.querySelector('#settings-save-btn');
                     if (saveBtn) saveBtn.disabled = true;
@@ -7295,6 +8439,39 @@ function renderSettings(content, data) {
                     if (isEnablingBasicAuth) {
                         showToast('Basic Auth enabled successfully! You will need to log in on your next visit.', 'success');
                     }
+                    
+                    // Detect if MaxMind credentials were changed — show setup modal
+                    const _maxmindChanged = ('maxmind_account_id' in payload || 'maxmind_license_key' in payload);
+                    const _maxmindHasValues = (payload.maxmind_license_key && payload.maxmind_license_key !== '' && payload.maxmind_license_key !== '********');
+                    if (_maxmindChanged && _maxmindHasValues) {
+                        // Modal handles loadSettings on close
+                        showGeoIPSetupModal();
+                        return;
+                    }
+                    
+                    // If disabled_features changed, purge data for newly disabled features and reload
+                    if ('disabled_features' in payload) {
+                        const purgeableNewlyDisabled = newlyDisabledFeatures.filter(f => PURGEABLE_FEATURES.includes(f));
+                        if (purgeableNewlyDisabled.length > 0) {
+                            showToast(`Purging data for ${purgeableNewlyDisabled.length} disabled feature(s)...`, 'info');
+                            for (const feature of purgeableNewlyDisabled) {
+                                try {
+                                    await authenticatedFetch('/api/settings/purge-feature-data', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ feature })
+                                    });
+                                } catch (purgeErr) {
+                                    console.warn(`Failed to purge data for feature '${feature}':`, purgeErr);
+                                }
+                            }
+                        }
+
+                        showToast('Features updated — reloading...', 'success');
+                        setTimeout(() => location.reload(), 600);
+                        return;
+                    }
+
                     await loadSettings();
                 } catch (err) {
                     const saveBtn = content.querySelector('#settings-save-btn');
@@ -7305,7 +8482,7 @@ function renderSettings(content, data) {
         }
         if (importBtn) {
             importBtn.onclick = async () => {
-                if (!confirm('Import current configuration from ENV into DB? This will overwrite existing DB-stored values.')) return;
+                if (!await showConfirmModal({ title: 'Import from ENV', message: 'Import current configuration from ENV into DB? This will overwrite existing DB-stored values.', confirmText: 'Import' })) return;
                 try {
                     importBtn.disabled = true;
                     const res = await authenticatedFetch('/api/settings/import-from-env', { method: 'POST' });
@@ -7325,6 +8502,195 @@ function renderSettings(content, data) {
     }
 }
 
+async function showGeoIPSetupModal() {
+    // Create modal overlay
+    const overlay = document.createElement('div');
+    overlay.id = 'geoip-setup-overlay';
+    overlay.className = 'fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50';
+    overlay.style.animation = 'fadeIn 0.2s ease-out';
+    
+    overlay.innerHTML = `
+        <div class="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-md mx-4 overflow-hidden">
+            <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+                <h3 class="text-lg font-semibold text-gray-900 dark:text-white flex items-center gap-2">
+                    <svg class="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                    </svg>
+                    GeoIP Database Setup
+                </h3>
+            </div>
+            <div class="px-6 py-5 space-y-4" id="geoip-setup-steps">
+                <div id="geoip-step-1" class="flex items-start gap-3">
+                    <div id="geoip-step-1-icon" class="mt-0.5 flex-shrink-0">
+                        <svg class="w-5 h-5 text-blue-500 animate-spin" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <p class="text-sm font-medium text-gray-900 dark:text-white">Checking credentials</p>
+                        <p id="geoip-step-1-detail" class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Verifying MaxMind configuration</p>
+                    </div>
+                </div>
+                <div id="geoip-step-2" class="flex items-start gap-3 opacity-40">
+                    <div id="geoip-step-2-icon" class="mt-0.5 flex-shrink-0">
+                        <div class="w-5 h-5 rounded-full border-2 border-gray-300 dark:border-gray-600"></div>
+                    </div>
+                    <div class="flex-1">
+                        <p class="text-sm font-medium text-gray-900 dark:text-white">Download databases</p>
+                        <p id="geoip-step-2-detail" class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Waiting...</p>
+                        <div id="geoip-progress-bar" class="hidden mt-2 w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2 overflow-hidden">
+                            <div id="geoip-progress-fill" class="bg-blue-500 h-full rounded-full transition-all duration-500" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+                <div id="geoip-step-3" class="flex items-start gap-3 opacity-40">
+                    <div id="geoip-step-3-icon" class="mt-0.5 flex-shrink-0">
+                        <div class="w-5 h-5 rounded-full border-2 border-gray-300 dark:border-gray-600"></div>
+                    </div>
+                    <div>
+                        <p class="text-sm font-medium text-gray-900 dark:text-white">Validate database integrity</p>
+                        <p id="geoip-step-3-detail" class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Waiting...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="px-6 py-4 border-t border-gray-200 dark:border-gray-700 flex justify-end">
+                <button id="geoip-setup-close-btn" class="px-4 py-2 bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg text-sm font-medium hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed" disabled>
+                    Close
+                </button>
+            </div>
+        </div>
+    `;
+    
+    document.body.appendChild(overlay);
+    
+    const closeBtn = document.getElementById('geoip-setup-close-btn');
+    closeBtn.addEventListener('click', async () => {
+        overlay.remove();
+        await loadSettings();
+    });
+    
+    const setStepStatus = (step, status, detail) => {
+        const iconEl = document.getElementById(`geoip-step-${step}-icon`);
+        const stepEl = document.getElementById(`geoip-step-${step}`);
+        const detailEl = document.getElementById(`geoip-step-${step}-detail`);
+        
+        stepEl.classList.remove('opacity-40');
+        if (detail) detailEl.textContent = detail;
+        
+        if (status === 'running') {
+            iconEl.innerHTML = '<svg class="w-5 h-5 text-blue-500 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path></svg>';
+        } else if (status === 'success') {
+            iconEl.innerHTML = '<svg class="w-5 h-5 text-green-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path></svg>';
+        } else if (status === 'error') {
+            iconEl.innerHTML = '<svg class="w-5 h-5 text-red-500" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path></svg>';
+        } else if (status === 'skipped') {
+            iconEl.innerHTML = '<svg class="w-5 h-5 text-gray-400" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v3.586L7.707 9.293a1 1 0 00-1.414 1.414l3 3a1 1 0 001.414 0l3-3a1 1 0 00-1.414-1.414L11 10.586V7z" clip-rule="evenodd"></path></svg>';
+        }
+    };
+    
+    try {
+        // ── Step 1: Verify credentials are configured ──
+        const credRes = await authenticatedFetch('/api/settings/geoip/status');
+        if (!credRes.ok) throw new Error('Failed to check status');
+        const credStatus = await credRes.json();
+        
+        if (credStatus.configured) {
+            setStepStatus(1, 'success', 'Credentials configured');
+        } else {
+            setStepStatus(1, 'error', 'MaxMind Account ID or License Key is missing');
+            closeBtn.disabled = false;
+            return;
+        }
+        
+        // ── Step 2: Check/Download databases ──
+        setStepStatus(2, 'running', 'Checking existing databases...');
+        
+        const statusRes = await authenticatedFetch('/api/settings/geoip/status');
+        const geoipStatus = await statusRes.json();
+        const cityAvail = geoipStatus.databases?.City?.available;
+        const asnAvail = geoipStatus.databases?.ASN?.available;
+        
+        if (cityAvail && asnAvail) {
+            setStepStatus(2, 'success', 'Databases already installed');
+        } else {
+            // Need to download
+            setStepStatus(2, 'running', 'Downloading GeoIP databases...');
+            const progressBar = document.getElementById('geoip-progress-bar');
+            const progressFill = document.getElementById('geoip-progress-fill');
+            progressBar.classList.remove('hidden');
+            
+            // Trigger download
+            await authenticatedFetch('/api/settings/geoip/download', { method: 'POST' });
+            
+            // Poll for completion
+            let progress = 5;
+            progressFill.style.width = progress + '%';
+            
+            const downloadComplete = await new Promise((resolve) => {
+                let polls = 0;
+                const interval = setInterval(async () => {
+                    polls++;
+                    if (polls > 90) { // 90 * 2s = 3 minutes
+                        clearInterval(interval);
+                        resolve(false);
+                        return;
+                    }
+                    
+                    // Animate progress (fake but smooth)
+                    progress = Math.min(90, progress + (90 - progress) * 0.08);
+                    progressFill.style.width = progress + '%';
+                    
+                    try {
+                        const res = await authenticatedFetch('/api/settings/geoip/status');
+                        const st = await res.json();
+                        
+                        if (st.job_status === 'success') {
+                            progressFill.style.width = '100%';
+                            clearInterval(interval);
+                            setTimeout(() => resolve(true), 400);
+                        } else if (st.job_status === 'failed') {
+                            clearInterval(interval);
+                            resolve(st.job_error || 'Download failed');
+                        }
+                    } catch (e) { /* continue */ }
+                }, 2000);
+            });
+            
+            if (downloadComplete === true) {
+                setStepStatus(2, 'success', 'Databases downloaded successfully');
+            } else {
+                const errMsg = typeof downloadComplete === 'string' ? downloadComplete : 'Download failed — check logs for details';
+                // Check if it's a credentials error
+                const isCredError = errMsg.toLowerCase().includes('401') || errMsg.toLowerCase().includes('unauthorized') || errMsg.toLowerCase().includes('invalid');
+                if (isCredError) {
+                    setStepStatus(1, 'error', 'Invalid credentials — download rejected by MaxMind');
+                }
+                setStepStatus(2, 'error', errMsg);
+                closeBtn.disabled = false;
+                return;
+            }
+        }
+        
+        // ── Step 3: Validate DB integrity ──
+        setStepStatus(3, 'running', 'Running test queries...');
+        
+        const valRes = await authenticatedFetch('/api/settings/geoip/validate', { method: 'POST' });
+        const valData = await valRes.json();
+        
+        if (valData.valid) {
+            setStepStatus(3, 'success', 'Database integrity verified — GeoIP is ready');
+        } else {
+            setStepStatus(3, 'error', valData.error || 'Validation failed — database may be corrupt');
+        }
+        
+    } catch (err) {
+        console.error('GeoIP setup error:', err);
+    }
+    
+    closeBtn.disabled = false;
+}
+
 function renderMaxMindStatus(status) {
     if (!status || !status.configured) {
         return `
@@ -7334,25 +8700,79 @@ function renderMaxMindStatus(status) {
         `;
     }
 
+    let html = '';
+    
+    // License badge
     if (status.valid) {
+        html += `
+            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400">
+                <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path>
+                </svg>
+                License Valid
+            </span>
+        `;
+    } else {
+        html += `
+            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
+                <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path>
+                </svg>
+                ${escapeHtml(status.error || 'Invalid')}
+            </span>
+        `;
+    }
+
+    return html;
+}
+
+function renderGeoIPDbStatus(geoipConfig) {
+    if (!geoipConfig) return '';
+    
+    // Don't show DB status if MaxMind is not configured
+    if (geoipConfig.enabled === false) return '';
+    
+    const dbValid = geoipConfig.db_valid;
+    
+    if (dbValid === true) {
         return `
             <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400">
                 <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
                     <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"></path>
                 </svg>
-                Configured
+                DB Healthy
+            </span>
+        `;
+    } else if (dbValid === false) {
+        return `
+            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
+                <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
+                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path>
+                </svg>
+                DB Corrupt
+            </span>
+        `;
+    } else {
+        // null = not checked yet — could be downloading
+        const dbs = geoipConfig.databases || {};
+        const cityAvail = dbs.City && dbs.City.available;
+        if (!cityAvail) {
+            return `
+                <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400">
+                    <svg class="w-3 h-3 mr-1 animate-spin" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                    </svg>
+                    Downloading...
+                </span>
+            `;
+        }
+        return `
+            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400">
+                Checking...
             </span>
         `;
     }
-
-    return `
-        <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
-            <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
-                <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path>
-            </svg>
-            ${escapeHtml(status.error || 'Invalid')}
-        </span>
-    `;
 }
 
 function renderImportCard(title, data, color) {
@@ -7402,29 +8822,34 @@ function renderJobCard(name, jobKey, job) {
     }
 
     const isRunning = job.status === 'running';
-    const isDisabled = job.status === 'disabled' || job.enabled === false;
+    const isFeatureOff = job.feature_disabled === true;
+    const isDisabled = job.status === 'disabled' || job.enabled === false || isFeatureOff;
 
     let statusBadge = '';
 
-    switch (job.status) {
-        case 'running':
-            statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-blue-500 text-white">running</span>';
-            break;
-        case 'success':
-            statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-green-600 dark:bg-green-500 text-white">success</span>';
-            break;
-        case 'failed':
-            statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-red-600 dark:bg-red-500 text-white">failed</span>';
-            break;
-        case 'scheduled':
-            statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-purple-600 dark:bg-purple-500 text-white">scheduled</span>';
-            break;
-        default:
-            statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-gray-500 text-white">idle</span>';
+    if (isFeatureOff) {
+        statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-orange-500/80 text-white">feature off</span>';
+    } else {
+        switch (job.status) {
+            case 'running':
+                statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-blue-500 text-white">running</span>';
+                break;
+            case 'success':
+                statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-green-600 dark:bg-green-500 text-white">success</span>';
+                break;
+            case 'failed':
+                statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-red-600 dark:bg-red-500 text-white">failed</span>';
+                break;
+            case 'scheduled':
+                statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-purple-600 dark:bg-purple-500 text-white">scheduled</span>';
+                break;
+            default:
+                statusBadge = '<span class="px-2 py-1 text-xs font-medium rounded bg-gray-500 text-white">idle</span>';
+        }
     }
 
     return `
-        <div class="p-3 bg-gray-50 dark:bg-gray-700/30 rounded-lg">
+        <div class="p-3 bg-gray-50 dark:bg-gray-700/30 rounded-lg ${isFeatureOff ? 'opacity-50' : ''}">
             <div class="flex items-start justify-between gap-3 mb-2">
                 <div class="flex-1 min-w-0">
                     <h4 class="font-semibold text-gray-900 dark:text-white text-sm">${name}</h4>
@@ -7515,6 +8940,77 @@ function showToast(message, type = 'info') {
             setTimeout(() => toast.remove(), 300);
         }
     }, 4000);
+}
+
+/**
+ * Show a styled confirmation modal (replaces native confirm()).
+ * Returns a Promise<boolean>: true if confirmed, false if cancelled.
+ */
+function showConfirmModal({ title = 'Confirm', message = 'Are you sure?', confirmText = 'Confirm', cancelText = 'Cancel', confirmColor, isDangerous = false } = {}) {
+    return new Promise((resolve) => {
+        const existing = document.getElementById('app-confirm-modal');
+        if (existing) existing.remove();
+
+        const gradientColor = confirmColor || (isDangerous
+            ? 'linear-gradient(135deg,#ef4444,#dc2626)'
+            : 'linear-gradient(135deg,#3b82f6,#2563eb)');
+
+        const iconBg = isDangerous
+            ? 'linear-gradient(135deg,#ef4444,#dc2626)'
+            : 'linear-gradient(135deg,#3b82f6,#2563eb)';
+
+        const iconSvg = isDangerous
+            ? '<path stroke-linecap="round" stroke-linejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"></path>'
+            : '<path stroke-linecap="round" stroke-linejoin="round" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>';
+
+        const overlay = document.createElement('div');
+        overlay.id = 'app-confirm-modal';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);';
+
+        const escapedMessage = message.replace(/\n/g, '<br>');
+
+        overlay.innerHTML = `
+            <div style="background:var(--color-bg-primary, #1f2937);border:1px solid var(--color-border, #374151);border-radius:12px;padding:28px;max-width:420px;width:90%;box-shadow:0 25px 50px rgba(0,0,0,0.4);">
+                <div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
+                    <div style="width:40px;height:40px;border-radius:10px;background:${iconBg};display:flex;align-items:center;justify-content:center;flex-shrink:0;">
+                        <svg width="20" height="20" fill="none" stroke="white" stroke-width="2" viewBox="0 0 24 24">${iconSvg}</svg>
+                    </div>
+                    <div>
+                        <h3 style="margin:0;font-size:16px;font-weight:600;color:#f3f4f6;">${title}</h3>
+                    </div>
+                </div>
+                <p style="margin:0 0 24px;font-size:14px;color:#d1d5db;line-height:1.5;">${escapedMessage}</p>
+                <div style="display:flex;justify-content:flex-end;gap:10px;">
+                    <button type="button" id="app-confirm-cancel"
+                        style="padding:9px 18px;border-radius:6px;border:1px solid #4b5563;background:transparent;color:#d1d5db;font-size:13px;font-weight:500;cursor:pointer;transition:all 0.15s;"
+                        onmouseover="this.style.background='#374151'" onmouseout="this.style.background='transparent'">
+                        ${cancelText}
+                    </button>
+                    <button type="button" id="app-confirm-ok"
+                        style="padding:9px 18px;border-radius:6px;border:none;background:${gradientColor};color:white;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.15s;"
+                        onmouseover="this.style.opacity='0.9'" onmouseout="this.style.opacity='1'">
+                        ${confirmText}
+                    </button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+        document.body.style.overflow = 'hidden';
+
+        const cancelBtn = document.getElementById('app-confirm-cancel');
+        const okBtn = document.getElementById('app-confirm-ok');
+
+        function cleanup(result) {
+            overlay.remove();
+            document.body.style.overflow = '';
+            resolve(result);
+        }
+
+        cancelBtn.addEventListener('click', () => cleanup(false));
+        okBtn.addEventListener('click', () => cleanup(true));
+        setTimeout(() => okBtn.focus(), 100);
+    });
 }
 
 // =============================================================================
@@ -9143,7 +10639,7 @@ function renderReportsManagementTable(reports, allowDelete) {
 }
 
 async function deleteReport(reportType, reportId, domain) {
-    if (!confirm(`Are you sure you want to delete this ${reportType.toUpperCase()} report for ${domain}?\n\nThis action cannot be undone.`)) {
+    if (!await showConfirmModal({ title: 'Delete Report', message: `Are you sure you want to delete this ${reportType.toUpperCase()} report for ${domain}?\n\nThis action cannot be undone.`, confirmText: 'Delete', isDangerous: true })) {
         return;
     }
 

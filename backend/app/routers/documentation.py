@@ -14,6 +14,8 @@ ALLOWED_DOCS = {
     "DMARC": "DMARC.md",
     "Mailbox_Stats": "Mailbox_Stats.md",
     "IP_Blacklist_Monitor": "IP_Blacklist_Monitor.md",
+    "Spam_Filter": "Spam_Filter.md",
+    "Quarantine": "Quarantine.md",
 }
 
 @router.get("/docs/{doc_name}", response_class=PlainTextResponse)

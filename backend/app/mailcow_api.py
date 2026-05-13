@@ -2,6 +2,7 @@
 Mailcow API client for fetching logs
 Handles authentication and API calls to mailcow instance
 """
+import asyncio
 import httpx
 import logging
 from typing import List, Dict, Any, Optional
@@ -54,6 +55,11 @@ class MailcowAPI:
         self._update_config()
         if old_url != self.base_url:
             logger.info(f"mailcow API client configuration reloaded: {old_url} -> {self.base_url}")
+    
+    @property
+    def has_rw_key(self) -> bool:
+        """Check if a Read-Write API key is configured."""
+        return self.headers_rw is not None
     
     @retry(
         stop=stop_after_attempt(3),
@@ -200,6 +206,103 @@ class MailcowAPI:
         except MailcowAPIError as e:
             logger.error(f"Failed to fetch Rspamd logs: {e}")
             return []
+    
+    async def get_postfix_logs_page(self, page_size: int, offset: int) -> List[Dict[str, Any]]:
+        """
+        Fetch a specific page of Postfix logs using mailcow's range syntax.
+        
+        Args:
+            page_size: Number of logs per page
+            offset: Starting offset (0-based). 
+                     offset=0 → /api/v1/get/logs/postfix/{page_size}
+                     offset=2000 → /api/v1/get/logs/postfix/2001-4000
+        
+        Returns:
+            List of log entries for this page
+        """
+        if offset == 0:
+            # First page: simple count
+            endpoint = f"/api/v1/get/logs/postfix/{page_size}"
+        else:
+            # Subsequent pages: range syntax (1-based)
+            start = offset + 1
+            end = offset + page_size
+            endpoint = f"/api/v1/get/logs/postfix/{start}-{end}"
+        
+        logger.info(f"Fetching Postfix logs page (offset={offset}, size={page_size}): {endpoint}")
+        try:
+            data = await self._make_request(endpoint)
+            
+            if not isinstance(data, list):
+                logger.warning(f"Unexpected Postfix page response format: {type(data)}")
+                return []
+            
+            logger.info(f"Retrieved {len(data)} Postfix logs (offset={offset})")
+            return data
+            
+        except MailcowAPIError as e:
+            logger.error(f"Failed to fetch Postfix logs page (offset={offset}): {e}")
+            return []
+    
+    async def get_rspamd_logs_page(self, page_size: int, offset: int) -> List[Dict[str, Any]]:
+        """
+        Fetch a specific page of Rspamd logs using mailcow's range syntax.
+        
+        Args:
+            page_size: Number of logs per page
+            offset: Starting offset (0-based).
+                     offset=0 → /api/v1/get/logs/rspamd-history/{page_size}
+                     offset=500 → /api/v1/get/logs/rspamd-history/501-1000
+        
+        Returns:
+            List of log entries for this page
+        """
+        if offset == 0:
+            # First page: simple count
+            endpoint = f"/api/v1/get/logs/rspamd-history/{page_size}"
+        else:
+            # Subsequent pages: range syntax (1-based)
+            start = offset + 1
+            end = offset + page_size
+            endpoint = f"/api/v1/get/logs/rspamd-history/{start}-{end}"
+        
+        logger.info(f"Fetching Rspamd logs page (offset={offset}, size={page_size}): {endpoint}")
+        try:
+            data = await self._make_request(endpoint)
+            
+            if not isinstance(data, list):
+                logger.warning(f"Unexpected Rspamd page response format: {type(data)}")
+                return []
+            
+            logger.info(f"Retrieved {len(data)} Rspamd logs (offset={offset})")
+            return data
+            
+        except MailcowAPIError as e:
+            logger.error(f"Failed to fetch Rspamd logs page (offset={offset}): {e}")
+            return []
+    
+    async def probe_log_position(self, log_type: str, position: int) -> bool:
+        """
+        Check if a log exists at the given position.
+        Uses range syntax N-N to request a single log entry.
+        
+        Args:
+            log_type: 'postfix' or 'rspamd-history'
+            position: 1-based log position to probe
+        
+        Returns:
+            True if a log exists at that position, False otherwise
+        """
+        endpoint = f"/api/v1/get/logs/{log_type}/{position}-{position}"
+        try:
+            data = await self._make_request(endpoint)
+            return isinstance(data, list) and len(data) > 0
+        except asyncio.CancelledError:
+            raise  # Let cancellation propagate
+        except MailcowAPIError:
+            return False
+        except Exception:
+            return False
     
     async def get_netfilter_logs(self, count: int = 500) -> List[Dict[str, Any]]:
         """
@@ -853,6 +956,201 @@ class MailcowAPI:
         )
         logger.info(f"Quarantine delete response: {data}")
         return data
+
+    async def learnham_quarantine(self, item_ids: List[str]) -> Any:
+        """
+        Release quarantined messages and train Rspamd that they are NOT spam (ham).
+        Sends POST to /api/v1/edit/qitem with action=learnham.
+        This releases the email AND teaches the Rspamd Bayes classifier + fuzzy hashes.
+        """
+        logger.info(f"Learn ham for quarantine items: {item_ids}")
+        payload = {
+            "items": item_ids,
+            "attr": {
+                "action": "learnham"
+            }
+        }
+        data = await self._make_rw_request(
+            "/api/v1/edit/qitem",
+            method="POST",
+            json=payload
+        )
+        logger.info(f"Quarantine learnham response: {data}")
+        return data
+
+    async def learnspam_quarantine(self, item_ids: List[str]) -> Any:
+        """
+        Delete quarantined messages and train Rspamd that they ARE spam.
+        Sends POST to /api/v1/edit/qitem with action=learnspam.
+        This deletes the email AND teaches the Rspamd Bayes classifier + fuzzy hashes.
+        """
+        logger.info(f"Learn spam for quarantine items: {item_ids}")
+        payload = {
+            "items": item_ids,
+            "attr": {
+                "action": "learnspam"
+            }
+        }
+        data = await self._make_rw_request(
+            "/api/v1/edit/qitem",
+            method="POST",
+            json=payload
+        )
+        logger.info(f"Quarantine learnspam response: {data}")
+        return data
+
+    async def get_quarantine_details(self, item_id: str) -> Any:
+        """
+        Get detailed quarantine item information by proxying to qitem_details.php.
+        Returns Rspamd symbols, email content (text/html), recipients, and more.
+        
+        Args:
+            item_id: Quarantine item ID
+            
+        Returns:
+            Parsed JSON response with detailed quarantine info
+        """
+        url = f"{self.base_url}/inc/ajax/qitem_details.php?id={item_id}"
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=self.verify_ssl) as client:
+            try:
+                response = await client.get(
+                    url,
+                    headers=self.headers
+                )
+                response.raise_for_status()
+                
+                data = response.json()
+                # The response is a list with a single element
+                if isinstance(data, list) and len(data) > 0:
+                    return data[0]
+                return data
+                
+            except httpx.HTTPStatusError as e:
+                raise MailcowAPIError(f"Failed to get quarantine details: HTTP {e.response.status_code}")
+            except Exception as e:
+                raise MailcowAPIError(f"Failed to get quarantine details: {str(e)}")
+
+    async def _make_rspamd_request(self, endpoint: str, method: str = "GET", extra_headers: dict = None, **kwargs) -> Any:
+        """
+        Make HTTP request to Rspamd API (via mailcow proxy at /rspamd/).
+        Uses Password header for authentication instead of X-API-Key.
+        
+        Args:
+            endpoint: Rspamd API endpoint (e.g., '/rspamd/maps')
+            method: HTTP method
+            extra_headers: Additional headers (e.g., map ID)
+            **kwargs: Additional arguments for httpx
+            
+        Returns:
+            Response from Rspamd API (varies by endpoint)
+            
+        Raises:
+            MailcowAPIError: If request fails or rspamd password not configured
+        """
+        rspamd_pw = settings.rspamd_password
+        if not rspamd_pw:
+            raise MailcowAPIError(
+                "Rspamd password (RSPAMD_PASSWORD) is not configured. "
+                "Set the Rspamd UI password in Settings to use Rspamd map features."
+            )
+        
+        url = f"{self.base_url}{endpoint}"
+        headers = {"Password": rspamd_pw}
+        if extra_headers:
+            headers.update(extra_headers)
+        
+        async with httpx.AsyncClient(timeout=self.timeout, verify=self.verify_ssl) as client:
+            try:
+                response = await client.request(method, url, headers=headers, **kwargs)
+                
+                if response.status_code == 401 or response.status_code == 403:
+                    raise MailcowAPIError("Rspamd password authentication failed. Check RSPAMD_PASSWORD setting.")
+                
+                response.raise_for_status()
+                return response
+                
+            except httpx.HTTPStatusError as e:
+                raise MailcowAPIError(f"Rspamd API request failed with status {e.response.status_code}")
+            except httpx.RequestError as e:
+                raise MailcowAPIError(f"Rspamd API request failed: {str(e)}")
+
+    async def get_rspamd_maps(self) -> List[Dict[str, Any]]:
+        """
+        List all Rspamd map files.
+        
+        GET /rspamd/maps
+        Header: Password
+        
+        Returns:
+            List of map metadata dicts with keys: map (id), description, uri, type, editable, loaded, cached
+        """
+        response = await self._make_rspamd_request("/rspamd/maps")
+        data = response.json()
+        if not isinstance(data, list):
+            logger.warning(f"Unexpected Rspamd maps response format: {type(data)}")
+            return []
+        return data
+
+    async def get_rspamd_map_content(self, map_id: int) -> str:
+        """
+        Read the content of a specific Rspamd map file.
+        
+        GET /rspamd/getmap
+        Headers: Password, map (map ID)
+        
+        Args:
+            map_id: The numeric map identifier from get_rspamd_maps()
+            
+        Returns:
+            Raw map content as text
+        """
+        response = await self._make_rspamd_request(
+            "/rspamd/getmap",
+            extra_headers={"map": str(map_id)}
+        )
+        return response.text
+
+    async def find_rspamd_map_id(self, map_filename: str) -> Optional[int]:
+        """
+        Find the numeric map ID for a given map filename.
+        
+        Args:
+            map_filename: Filename to search for (e.g., 'global_rcpt_blacklist.map')
+            
+        Returns:
+            Map ID if found, None otherwise
+        """
+        maps = await self.get_rspamd_maps()
+        for m in maps:
+            uri = m.get("uri", "")
+            if map_filename in uri:
+                return m.get("map")
+        return None
+
+    async def edit_rspamd_map(self, map_filename: str, map_data: str) -> Any:
+        """
+        Update the content of an Rspamd map file via mailcow API.
+        
+        POST /api/v1/edit/rspamd-map
+        Uses Read-Write API key (X-API-Key header).
+        
+        Args:
+            map_filename: The map file name (e.g., 'global_rcpt_blacklist.map')
+            map_data: The full map content to write
+            
+        Returns:
+            Response from mailcow API
+        """
+        payload = {
+            "items": [map_filename],
+            "attr": {"rspamd_map_data": map_data}
+        }
+        return await self._make_rw_request(
+            "/api/v1/edit/rspamd-map",
+            method="POST",
+            json=payload
+        )
 
     @property
     def has_rw_key(self) -> bool:

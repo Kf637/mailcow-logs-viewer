@@ -937,6 +937,85 @@ async def delete_quarantine(request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/quarantine/learnham")
+async def learnham_quarantine(request: Request):
+    """
+    Release quarantined messages and train Rspamd that they are NOT spam.
+    Sends POST to /api/v1/edit/qitem with action=learnham.
+    """
+    try:
+        body = await request.json()
+        items = body.get("items", [])
+        if not items:
+            raise HTTPException(status_code=400, detail="Missing 'items' array")
+        
+        items = [str(item) for item in items]
+        
+        result = await mailcow_api.learnham_quarantine(items)
+        
+        if isinstance(result, list) and len(result) > 0:
+            first = result[0]
+            if first.get("type") == "success":
+                return {"status": "success", "msg": first.get("msg", "Message(s) released and learned as ham")}
+            else:
+                return {"status": "error", "msg": first.get("msg", "Learn ham failed")}
+        
+        return {"status": "success", "msg": "Message(s) released and learned as ham", "raw": result}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error learning ham for quarantine items: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/quarantine/learnspam")
+async def learnspam_quarantine(request: Request):
+    """
+    Delete quarantined messages and train Rspamd that they ARE spam.
+    Sends POST to /api/v1/edit/qitem with action=learnspam.
+    """
+    try:
+        body = await request.json()
+        items = body.get("items", [])
+        if not items:
+            raise HTTPException(status_code=400, detail="Missing 'items' array")
+        
+        items = [str(item) for item in items]
+        
+        result = await mailcow_api.learnspam_quarantine(items)
+        
+        if isinstance(result, list) and len(result) > 0:
+            first = result[0]
+            if first.get("type") == "success":
+                return {"status": "success", "msg": first.get("msg", "Message(s) deleted and learned as spam")}
+            else:
+                return {"status": "error", "msg": first.get("msg", "Learn spam failed")}
+        
+        return {"status": "success", "msg": "Message(s) deleted and learned as spam", "raw": result}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error learning spam for quarantine items: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/quarantine/{item_id}/details")
+async def get_quarantine_details(item_id: str):
+    """
+    Get detailed information for a quarantine item.
+    Proxies to mailcow's qitem_details.php for full email details
+    including Rspamd symbols, email content, and recipients.
+    """
+    try:
+        result = await mailcow_api.get_quarantine_details(item_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error fetching quarantine details for item {item_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/message/{correlation_key}")
 async def get_message_details(
     correlation_key: str,

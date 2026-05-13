@@ -47,15 +47,19 @@ class Settings(BaseSettings):
     fetch_interval: int = Field(default=60, description="Seconds between log fetches")
     fetch_count_postfix: int = Field(
         default=2000, 
-        description="Postfix logs to fetch per request"
+        description="Postfix logs to fetch per API request (page size for paginated fetching)"
     )
     fetch_count_rspamd: int = Field(
         default=500, 
-        description="Rspamd logs to fetch per request"
+        description="Rspamd logs to fetch per API request (page size for paginated fetching)"
     )
     fetch_count_netfilter: int = Field(
         default=500, 
         description="Netfilter logs to fetch per request"
+    )
+    fetch_max_pages: int = Field(
+        default=50,
+        description="Maximum number of pages to fetch per cycle for Postfix/Rspamd (safety limit to prevent infinite loops)"
     )
     retention_days: int = Field(default=7, description="Days to keep logs")
     
@@ -88,6 +92,10 @@ class Settings(BaseSettings):
     )
     app_title: str = Field(default="mailcow Logs Viewer", description="Application title")
     app_logo_url: str = Field(default="", description="Application logo URL (optional)")
+    disabled_features: str = Field(
+        default="",
+        description="Comma-separated list of features to disable (hides page and stops related jobs). Valid: netfilter, queue, quarantine, spam-filter, domains, dmarc, mailbox-stats, logs, blacklist"
+    )
     
     # Settings UI: allow editing config from web UI (overrides stored in DB). ENV only; default False.
     # Field name avoids "settings_" prefix (Pydantic protected namespace).
@@ -400,6 +408,89 @@ class Settings(BaseSettings):
         description='Comma-separated list of mailcow services to collect raw logs from'
     )
 
+    # Rspamd Integration
+    rspamd_password: Optional[str] = Field(
+        default=None,
+        env='RSPAMD_PASSWORD',
+        description='Rspamd UI/API password for reading Rspamd map data'
+    )
+
+    # Spam Suppression Configuration
+    suppression_enabled: bool = Field(
+        default=False,
+        env='SUPPRESSION_ENABLED',
+        description='Enable spam suppression feature (auto-blocks recipients that bounce/reject)'
+    )
+    suppression_auto_detect: bool = Field(
+        default=True,
+        env='SUPPRESSION_AUTO_DETECT',
+        description='Auto-detect bounced/rejected outbound emails and add to suppression list'
+    )
+    suppression_rspamd_sync: bool = Field(
+        default=True,
+        env='SUPPRESSION_RSPAMD_SYNC',
+        description='Auto-sync suppression list to Rspamd global_rcpt_blacklist.map'
+    )
+    suppression_whitelist_domains: str = Field(
+        default='',
+        env='SUPPRESSION_WHITELIST_DOMAINS',
+        description='Comma-separated list of domains that should never be suppressed'
+    )
+    suppression_hard_bounce_action: str = Field(
+        default='suppress',
+        env='SUPPRESSION_HARD_BOUNCE_ACTION',
+        description='Action for hard bounces (DSN 5.x.x): suppress or ignore'
+    )
+    suppression_soft_bounce_action: str = Field(
+        default='count',
+        env='SUPPRESSION_SOFT_BOUNCE_ACTION',
+        description='Action for soft bounces (DSN 4.x.x): suppress, count, or ignore'
+    )
+    suppression_soft_bounce_threshold: int = Field(
+        default=3,
+        env='SUPPRESSION_SOFT_BOUNCE_THRESHOLD',
+        description='Number of soft bounces before suppression (when action=count)'
+    )
+    suppression_base_expiry_days: int = Field(
+        default=7,
+        env='SUPPRESSION_BASE_EXPIRY_DAYS',
+        description='Base suppression period in days (multiplied by bounce_count for progressive expiry)'
+    )
+    suppression_max_expiry_days: int = Field(
+        default=90,
+        env='SUPPRESSION_MAX_EXPIRY_DAYS',
+        description='Maximum suppression period cap in days'
+    )
+
+    # Deferred Queue Cleanup
+    queue_cleanup_enabled: bool = Field(
+        default=True,
+        env='QUEUE_CLEANUP_ENABLED',
+        description='Automatically delete deferred emails stuck longer than threshold and suppress their recipients'
+    )
+    queue_cleanup_threshold_minutes: int = Field(
+        default=60,
+        env='QUEUE_CLEANUP_THRESHOLD_MINUTES',
+        description='Minutes a deferred email must be stuck before it is deleted and recipient suppressed'
+    )
+
+    # Quarantine Auto-Rules Configuration
+    quarantine_rules_max_actions: int = Field(
+        default=50,
+        env='QUARANTINE_RULES_MAX_ACTIONS',
+        description='Safety limit: maximum emails to release/delete per scheduler run (prevents mass-processing from overly broad rules)'
+    )
+    quarantine_rules_interval: int = Field(
+        default=5,
+        env='QUARANTINE_RULES_INTERVAL',
+        description='Minutes between quarantine rule processing runs (lower = faster response, higher = less load)'
+    )
+    quarantine_rules_log_retention_days: int = Field(
+        default=30,
+        env='QUARANTINE_RULES_LOG_RETENTION_DAYS',
+        description='Days to keep quarantine auto-rule action history (older logs are automatically cleaned up)'
+    )
+
     @field_validator('smtp_port', 'dmarc_imap_port', 'dmarc_imap_interval', mode='before')
     @classmethod
     def empty_str_to_none(cls, v):
@@ -469,6 +560,27 @@ class Settings(BaseSettings):
         return [s.strip().lower() for s in val.split(',') if s.strip()]
     
     @property
+    def suppression_whitelist_domains_list(self) -> List[str]:
+        """Parse suppression whitelist domains into a list"""
+        if not self.suppression_whitelist_domains:
+            return []
+        return [d.strip().lower() for d in self.suppression_whitelist_domains.split(',') if d.strip()]
+    
+    @property
+    def is_suppression_configured(self) -> bool:
+        """Check if suppression feature is fully configured (enabled + RW key + rspamd password for sync)"""
+        return (
+            self.suppression_enabled and
+            self.mailcow_api_key_rw is not None and
+            bool(self.mailcow_api_key_rw)
+        )
+    
+    @property
+    def is_rspamd_configured(self) -> bool:
+        """Check if Rspamd integration is configured (password set)"""
+        return self.rspamd_password is not None and bool(self.rspamd_password)
+    
+    @property
     def notification_smtp_configured(self) -> bool:
         """Check if SMTP is properly configured for notifications"""
         if self.smtp_relay_mode:
@@ -502,6 +614,17 @@ class Settings(BaseSettings):
             f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def disabled_features_set(self) -> set:
+        """Parse disabled_features into a set of feature IDs."""
+        if not self.disabled_features:
+            return set()
+        return {f.strip().lower() for f in self.disabled_features.split(',') if f.strip()}
+
+    def is_feature_enabled(self, feature: str) -> bool:
+        """Check if a feature is enabled (not in disabled_features)."""
+        return feature not in self.disabled_features_set
     
     class Config:
         env_file = ".env"
