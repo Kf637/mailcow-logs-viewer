@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-05-17
+
+### Fixed
+
+#### GeoIP Backfill Infinite Loop on Startup
+- **Application startup could hang indefinitely** when IP addresses could not be resolved by the GeoIP database
+  - The backfill loop fetched rows with `country_code IS NULL`, but only updated them when a valid country was returned — unresolvable IPs were never updated and re-fetched forever
+  - Now assigns fallback values (`ZZ` / `Unknown`) for any IP that cannot be resolved, ensuring every row is processed exactly once
+  - Thanks to [@P7aM5qzEddT66lE](https://github.com/P7aM5qzEddT66lE) for reporting and submitting the fix ([#58](https://github.com/ShlomiPorush/mailcow-logs-viewer/pull/58))
+
+#### Startup Crash with `DEBUG=true`
+- **Application crashed immediately on startup** when `DEBUG=true` was set in environment variables ([#57](https://github.com/ShlomiPorush/mailcow-logs-viewer/issues/57))
+  - Engine initialization now conditionally applies `pool_size`/`max_overflow` only when using the standard connection pool
+
+#### Settings Page Freeze (~30 Seconds)
+- **Settings page could hang for up to 30 seconds**, especially after the application hadn't been accessed for several days
+  - Root cause: the `GET /api/settings/info` endpoint made a **synchronous external HTTP call** to MaxMind's license validation API on every page load — if DNS cache expired or the network was slow, TCP connect timeout could block for 30+ seconds
+  - MaxMind license validation is now **fully on-demand**: the settings page no longer checks license validity automatically. Instead, a "Validate" button lets users check when they want to
+  - Added `POST /api/settings/maxmind/validate` endpoint for on-demand validation
+
+### Changed
+
+#### MaxMind License Status
+  - Validation results are now **persisted in the database** (`system_settings` table) and survive page refreshes, container restarts, and re-deployments
+  - Clearing MaxMind credentials properly resets the status back to "Not checked"
+
+#### MaxMind Settings UI Improvements
+- **"Validate" button** for MaxMind license validation now appears **only when credentials are configured** (not when empty)
+- **"Repair" button** added for corrupted GeoIP databases — automatically re-downloads and re-validates database files when "DB Corrupt" status is detected
+
+#### Fail2Ban IP Lists Redesign ([#51](https://github.com/ShlomiPorush/mailcow-logs-viewer/issues/51))
+- **Added Active Bans list** showing all currently banned IPs with visual distinction between permanent and temporary bans
+  - **Permanent bans** (red badge): IPs from the denylist — cannot be unbanned directly, must be removed from the denylist
+  - **Temporary bans** (amber badge): dynamically banned by Fail2Ban with remaining ban time displayed and an "Unban" button
+  - IPs queued for unbanning show a "Unbanning..." status indicator
+- Simplified IP Lists layout from 3 columns to 2 (Allowlist + Denylist) with the Active Bans section below
+
+---
+
 ## [2.6.0] - 2026-05-06
 
 ### Added

@@ -16,7 +16,7 @@ from ..models import PostfixLog, RspamdLog, NetfilterLog, MessageCorrelation
 from ..config import settings, EDITABLE_SETTING_KEYS, reload_settings, Settings
 from ..config import _get_field_annotations, get_env_locked_keys
 from ..scheduler import last_fetch_run_time, get_job_status, update_job_status, reschedule_interval_jobs
-from ..services.settings_store import get_config_overrides_from_db, save_config_overrides_to_db, has_config_overrides_in_db
+from ..services.settings_store import get_config_overrides_from_db, save_config_overrides_to_db, has_config_overrides_in_db, get_maxmind_validation_status, save_maxmind_validation_status, clear_maxmind_validation_status
 from ..services.connection_test import test_smtp_connection, test_imap_connection
 from ..services.geoip_downloader import is_license_configured, get_geoip_status
 from .domains import get_cached_server_ip
@@ -190,7 +190,7 @@ async def get_settings_info(db: Session = Depends(get_db)):
                 "oauth2_enabled": settings.is_oauth2_enabled,
                 "auth_username": settings.auth_username if settings.is_basic_auth_enabled else None,
                 "oauth2_provider_name": settings.oauth2_provider_name if settings.is_oauth2_enabled else None,
-                "maxmind_status": await validate_maxmind_license()
+                "maxmind_status": get_maxmind_validation_status(db)  # Last validated result from DB, or None if never checked
             },
             "import_status": {
                 "postfix": {
@@ -602,6 +602,10 @@ async def update_settings(body: Dict[str, Any], db: Session = Depends(get_db)):
     mailcow_api.reload_config()
     oauth2_client.reload_config()
     reschedule_interval_jobs()
+
+    # Invalidate MaxMind license cache when credentials change
+    if 'maxmind_license_key' in allowed or 'maxmind_account_id' in allowed:
+        clear_maxmind_validation_status(db)
     
     return {"settings_edit_via_ui_enabled": True, "settings_migrated": True, "configuration": _effective_config_for_editable(settings)}
 
@@ -752,15 +756,22 @@ async def get_health_detailed(db: Session = Depends(get_db)):
             "error": str(e)
         }
 
-async def validate_maxmind_license() -> Dict[str, Any]:
-    """Validate MaxMind license key"""
+async def validate_maxmind_license(db=None) -> Dict[str, Any]:
+    """Validate MaxMind license key against MaxMind's API.
+    Called on-demand only (user clicks 'Validate License' or before GeoIP download).
+    Stores the result in DB so it persists across restarts.
+    """
     license_key = settings.maxmind_license_key
     
     if not license_key:
-        return {"configured": False, "valid": False, "error": None}
+        result = {"configured": False, "valid": False, "error": None}
+        if db:
+            save_maxmind_validation_status(db, result)
+        return result
     
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        timeout = httpx.Timeout(5.0, connect=3.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 "https://secret-scanning.maxmind.com/secrets/validate-license-key",
                 data={"license_key": license_key},
@@ -768,13 +779,18 @@ async def validate_maxmind_license() -> Dict[str, Any]:
             )
             
             if response.status_code == 204:
-                return {"configured": True, "valid": True, "error": None}
+                result = {"configured": True, "valid": True, "error": None}
             elif response.status_code == 401:
-                return {"configured": True, "valid": False, "error": "Invalid"}
+                result = {"configured": True, "valid": False, "error": "Invalid"}
             else:
-                return {"configured": True, "valid": False, "error": f"Status {response.status_code}"}
+                result = {"configured": True, "valid": False, "error": f"Status {response.status_code}"}
     except Exception:
-        return {"configured": True, "valid": False, "error": "Connection error"}
+        result = {"configured": True, "valid": False, "error": "Connection error"}
+    
+    if db:
+        save_maxmind_validation_status(db, result)
+    return result
+
 
 
 def _run_async_in_background(coro_func):
@@ -829,6 +845,17 @@ async def trigger_geoip_download(background_tasks: BackgroundTasks):
     from ..scheduler import update_geoip_database
     background_tasks.add_task(_run_async_in_background, update_geoip_database)
     return {"status": "started", "message": "GeoIP download started in background"}
+
+
+@router.post("/settings/maxmind/validate")
+async def validate_maxmind_license_endpoint(db: Session = Depends(get_db)):
+    """
+    Validate MaxMind license key on-demand.
+    Called when the user clicks 'Validate License' in settings.
+    Persists the result to DB.
+    """
+    result = await validate_maxmind_license(db=db)
+    return result
 
 
 @router.post("/settings/geoip/validate")
