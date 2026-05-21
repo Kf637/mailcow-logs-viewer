@@ -2347,7 +2347,8 @@ Returns comprehensive system configuration, import status, correlation status, a
     "maxmind_status": {
       "configured": true,
       "valid": true,
-      "error": null
+      "error": null,
+      "checked_at": "2026-05-15T14:30:00Z"
     }
   },
   "import_status": {
@@ -2983,6 +2984,53 @@ Trigger GeoIP database download in background.
 - Use `GET /api/settings/geoip/status` to poll progress (`job_status` field)
 - Download includes both GeoLite2-City and GeoLite2-ASN databases
 - After download completes, readers are reloaded and validated automatically
+
+---
+
+### POST /api/settings/maxmind/validate
+
+Validate MaxMind license key on-demand. Result is persisted to database.
+
+**Authentication:** Required
+
+**Response (valid):**
+```json
+{
+  "configured": true,
+  "valid": true,
+  "error": null
+}
+```
+
+**Response (invalid):**
+```json
+{
+  "configured": true,
+  "valid": false,
+  "error": "Invalid"
+}
+```
+
+**Response (not configured):**
+```json
+{
+  "configured": false,
+  "valid": false,
+  "error": null
+}
+```
+
+**Response Fields:**
+- `configured`: Boolean — whether a MaxMind license key is present
+- `valid`: Boolean — whether the license key passed MaxMind's validation API
+- `error`: String or null — error description if validation failed (`"Invalid"`, `"Connection error"`, `"Status {code}"`)
+
+**Notes:**
+- Validates against MaxMind's `secret-scanning.maxmind.com` API with a 5-second timeout
+- Result is **persisted in the database** (`system_settings` table) so it survives page refreshes and container restarts
+- The `maxmind_status` field in `GET /api/settings/info` returns the last persisted result (or `null` if never checked)
+- Clearing MaxMind credentials via `PUT /api/settings` automatically clears the persisted validation result
+- The scheduled "Update MaxMind Databases" job also marks the license as valid after a successful database download
 
 ---
 

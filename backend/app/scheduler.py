@@ -1586,6 +1586,20 @@ async def update_geoip_database():
                 geoip_service.reload_geoip_readers()
             update_job_status('update_geoip', 'success')
         
+        # Successful download implies valid license — persist to DB
+        # so the settings page shows "License Valid" without a manual check
+        if status['City']['available'] or status['ASN']['available']:
+            try:
+                from .services.settings_store import save_maxmind_validation_status
+                with get_db_context() as db:
+                    save_maxmind_validation_status(db, {
+                        "configured": True,
+                        "valid": True,
+                        "error": None
+                    })
+            except Exception as e:
+                logger.debug(f"Failed to persist license status after GeoIP update: {e}")
+        
     except asyncio.CancelledError:
         logger.info("GeoIP update cancelled by shutdown")
         return

@@ -2285,6 +2285,17 @@ async function loadFail2BanSettings() {
             </form>
         `;
 
+        // Build unified active bans list (permanent + temporary)
+        const activeBans = data.active_bans || [];
+        const permBanNetworks = new Set(permBans.map(b => b.network || b.ip));
+        // Temporary bans = active_bans entries NOT in perm_bans
+        const tempBans = activeBans.filter(b => !permBanNetworks.has(b.network));
+        // Sort both lists by IP address
+        const ipSort = (a, b) => (a.ip || a.network || '').localeCompare(b.ip || b.network || '', undefined, { numeric: true });
+        permBans.sort(ipSort);
+        tempBans.sort(ipSort);
+        const totalBans = permBans.length + tempBans.length;
+
         // Render IP lists in separate accordion (editable textareas)
         if (ipListsContainer) {
             ipListsContainer.innerHTML = `
@@ -2298,7 +2309,7 @@ async function loadFail2BanSettings() {
                             </button>
                         </div>
                     ` : ''}
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                         <div class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                             <label class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2 block">Allowlisted <span class="text-gray-400 dark:text-gray-500">(${whitelistEntries.length})</span></label>
                             <textarea name="whitelist" rows="4" placeholder="One IP/network per line"
@@ -2311,15 +2322,6 @@ async function loadFail2BanSettings() {
                             <textarea name="blacklist" rows="4" placeholder="One IP/network per line"
                                 class="w-full px-2 py-1.5 text-sm font-mono rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-red-700 dark:text-red-400 focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-y"
                                 disabled>${escapeHtml((data.blacklist || '').replace(/,/g, '\n'))}</textarea>
-                        </div>
-
-                        <div class="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
-                            <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">Permanent Bans <span class="text-gray-400 dark:text-gray-500">(${permBans.length})</span></div>
-                            ${permBans.length > 0 ? `
-                                <div class="space-y-1">
-                                    ${permBans.map(ban => `<div class="text-sm font-mono text-red-700 dark:text-red-400">${escapeHtml(ban.network || ban.ip)}</div>`).join('')}
-                                </div>
-                            ` : '<div class="text-sm text-gray-400 dark:text-gray-500">None</div>'}
                         </div>
                     </div>
 
@@ -2335,6 +2337,41 @@ async function loadFail2BanSettings() {
                         </button>
                     </div>
                 </form>
+
+                <!-- Active Bans List -->
+                <div class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+                    <div class="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">
+                        Active Bans <span class="text-gray-400 dark:text-gray-500">(${totalBans})</span>
+                    </div>
+                    ${totalBans > 0 ? `
+                        <div class="space-y-2">
+                            ${permBans.map(ban => `
+                                <div class="flex items-center justify-between bg-gray-50 dark:bg-gray-700/50 rounded-lg px-3 py-2">
+                                    <div class="flex items-center gap-3">
+                                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">Permanent</span>
+                                        <span class="text-sm font-mono text-gray-900 dark:text-white">${escapeHtml(ban.network || ban.ip)}</span>
+                                    </div>
+                                </div>
+                            `).join('')}
+                            ${tempBans.map(ban => `
+                                <div class="flex items-center justify-between bg-gray-50 dark:bg-gray-700/50 rounded-lg px-3 py-2">
+                                    <div class="flex items-center gap-3">
+                                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400">Temporary</span>
+                                        <span class="text-sm font-mono text-gray-900 dark:text-white">${escapeHtml(ban.network || ban.ip)}</span>
+                                        ${ban.banned_until ? `<span class="text-xs text-gray-500 dark:text-gray-400">${escapeHtml(ban.banned_until)} left</span>` : ''}
+                                        ${ban.queued_for_unban ? `<span class="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400">Unbanning...</span>` : ''}
+                                    </div>
+                                    ${canEdit && !ban.queued_for_unban ? `
+                                        <button type="button" onclick="unbanIP('${escapeHtml(ban.ip || ban.network)}', this)"
+                                            class="px-2.5 py-1 text-xs font-medium rounded-md border border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-red-50 hover:border-red-300 hover:text-red-700 dark:hover:bg-red-900/20 dark:hover:border-red-700 dark:hover:text-red-400 transition-colors">
+                                            Unban
+                                        </button>
+                                    ` : ''}
+                                </div>
+                            `).join('')}
+                        </div>
+                    ` : '<div class="text-sm text-gray-400 dark:text-gray-500">No active bans</div>'}
+                </div>
             `;
         }
 
@@ -7690,6 +7727,16 @@ function renderSettings(content, data) {
     const appVersion = data.app_version || 'Unknown';
     const versionInfo = data.version_info || {};
 
+    // Sync MaxMind status: backend DB is the source of truth.
+    // Frontend cache only bridges the gap between a validate click and next full reload.
+    if (config.maxmind_status !== null && config.maxmind_status !== undefined) {
+        // Backend returned a persisted result from DB — use it
+        _cachedMaxMindStatus = config.maxmind_status;
+    } else if (_cachedMaxMindStatus) {
+        // Backend returned null (never checked) but we just validated in this session — show it
+        config.maxmind_status = _cachedMaxMindStatus;
+    }
+
     content.innerHTML = `
         <!-- Version Information Section -->
         <div class="bg-white dark:bg-gray-800 rounded-lg shadow-sm border border-gray-200 dark:border-gray-700 mb-6">
@@ -7893,8 +7940,14 @@ function renderSettings(content, data) {
                     <div class="p-3 bg-gray-50 dark:bg-gray-700/30 rounded-lg">
                         <p class="text-xs font-medium text-gray-500 dark:text-gray-400">MaxMind Status</p>
                         <div class="flex flex-wrap items-center gap-1 mt-1">
-                            ${renderMaxMindStatus(data.configuration.maxmind_status)}
+                            <span id="maxmind-license-status">${renderMaxMindStatus(data.configuration.maxmind_status)}</span>
                             ${data.geoip_configuration ? renderGeoIPDbStatus(data.geoip_configuration) : ''}
+                            ${data.geoip_configuration && data.geoip_configuration.enabled ? `
+                            <button type="button" onclick="validateMaxMindLicense()" class="px-2 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded text-xs font-medium transition-colors duration-200 flex items-center gap-1">
+                                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                Validate
+                            </button>
+                            ` : ''}
                         </div>
                     </div>
                     ` : ''}
@@ -7984,7 +8037,11 @@ function renderSettings(content, data) {
                     // License Status
                     tabsHtml += '<div class="p-4 bg-white dark:bg-gray-800 rounded-lg">';
                     tabsHtml += '<p class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">License</p>';
-                    tabsHtml += '<div class="flex items-center gap-2">' + renderMaxMindStatus(data.configuration.maxmind_status) + '</div>';
+                    tabsHtml += '<div class="flex items-center gap-2"><span id="maxmind-license-status-tab">' + renderMaxMindStatus(data.configuration.maxmind_status) + '</span>';
+                    if (data.geoip_configuration && data.geoip_configuration.enabled) {
+                        tabsHtml += '<button type="button" onclick="validateMaxMindLicense()" class="px-2 py-1 bg-blue-500 hover:bg-blue-600 text-white rounded text-xs font-medium transition-colors duration-200 flex items-center gap-1"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>Validate</button>';
+                    }
+                    tabsHtml += '</div>';
                     tabsHtml += '</div>';
                     
                     // DB Health
@@ -8442,6 +8499,7 @@ function renderSettings(content, data) {
                     
                     // Detect if MaxMind credentials were changed — show setup modal
                     const _maxmindChanged = ('maxmind_account_id' in payload || 'maxmind_license_key' in payload);
+                    if (_maxmindChanged) _cachedMaxMindStatus = null; // Clear stale validation cache
                     const _maxmindHasValues = (payload.maxmind_license_key && payload.maxmind_license_key !== '' && payload.maxmind_license_key !== '********');
                     if (_maxmindChanged && _maxmindHasValues) {
                         // Modal handles loadSettings on close
@@ -8596,7 +8654,21 @@ async function showGeoIPSetupModal() {
         const credStatus = await credRes.json();
         
         if (credStatus.configured) {
-            setStepStatus(1, 'success', 'Credentials configured');
+            // Validate the license key (stores result server-side for future page loads)
+            const valLicRes = await authenticatedFetch('/api/settings/maxmind/validate', { method: 'POST' });
+            const valLicData = valLicRes.ok ? await valLicRes.json() : null;
+            
+            if (valLicData && valLicData.valid) {
+                _cachedMaxMindStatus = valLicData;
+                setStepStatus(1, 'success', 'Credentials configured');
+            } else if (valLicData && valLicData.error) {
+                _cachedMaxMindStatus = valLicData;
+                setStepStatus(1, 'error', 'License validation failed: ' + valLicData.error);
+                closeBtn.disabled = false;
+                return;
+            } else {
+                setStepStatus(1, 'success', 'Credentials configured');
+            }
         } else {
             setStepStatus(1, 'error', 'MaxMind Account ID or License Key is missing');
             closeBtn.disabled = false;
@@ -8691,8 +8763,145 @@ async function showGeoIPSetupModal() {
     closeBtn.disabled = false;
 }
 
+// Cache last MaxMind validation result so re-renders don't lose it
+var _cachedMaxMindStatus = null;
+
+async function validateMaxMindLicense() {
+    // Show checking state on all MaxMind status badges
+    const checkingHtml = `
+        <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+            <svg class="w-3 h-3 mr-1 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+            </svg>
+            Checking…
+        </span>
+    `;
+    ['maxmind-license-status', 'maxmind-license-status-tab'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.innerHTML = checkingHtml;
+    });
+
+    try {
+        const response = await authenticatedFetch('/api/settings/maxmind/validate', { method: 'POST' });
+        const result = response.ok ? await response.json() : { configured: true, valid: false, error: 'Request failed' };
+        
+        // Cache the result so re-renders preserve it
+        _cachedMaxMindStatus = result;
+
+        const statusHtml = renderMaxMindStatus(result);
+        ['maxmind-license-status', 'maxmind-license-status-tab'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.innerHTML = statusHtml;
+        });
+
+        if (result.valid) {
+            showToast('MaxMind license is valid', 'success');
+        } else if (result.error) {
+            showToast('MaxMind license validation failed: ' + result.error, 'error');
+        }
+    } catch (error) {
+        console.error('Failed to validate MaxMind license:', error);
+        const errorHtml = renderMaxMindStatus({ configured: true, valid: false, error: 'Connection error' });
+        ['maxmind-license-status', 'maxmind-license-status-tab'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.innerHTML = errorHtml;
+        });
+        showToast('Failed to validate MaxMind license', 'error');
+    }
+}
+
+async function repairGeoIPDatabase() {
+    const statusEl = document.getElementById('geoip-db-status');
+    if (statusEl) {
+        statusEl.innerHTML = `
+            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                <svg class="w-3 h-3 mr-1 animate-spin" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                </svg>
+                Repairing…
+            </span>
+        `;
+    }
+
+    try {
+        // Step 1: Trigger re-download of databases
+        const downloadRes = await authenticatedFetch('/api/settings/geoip/download', { method: 'POST' });
+        if (!downloadRes.ok) {
+            throw new Error('Failed to start download');
+        }
+
+        showToast('GeoIP database re-download started…', 'info');
+
+        // Step 2: Poll geoip/status until download completes (max 60s)
+        let attempts = 0;
+        const maxAttempts = 30;
+        const pollInterval = 2000;
+        
+        const pollStatus = async () => {
+            attempts++;
+            try {
+                const statusRes = await authenticatedFetch('/api/settings/geoip/status');
+                if (statusRes.ok) {
+                    const data = await statusRes.json();
+                    if (data.job_status === 'idle' && attempts > 2) {
+                        // Download finished — now validate
+                        const validateRes = await authenticatedFetch('/api/settings/geoip/validate', { method: 'POST' });
+                        if (validateRes.ok) {
+                            const result = await validateRes.json();
+                            if (statusEl) {
+                                const cfg = { db_valid: result.valid, databases: data.databases };
+                                statusEl.innerHTML = renderGeoIPDbStatus(cfg);
+                            }
+                            if (result.valid) {
+                                showToast('GeoIP databases repaired successfully', 'success');
+                            } else {
+                                showToast('GeoIP databases re-downloaded but validation still failed', 'error');
+                            }
+                        }
+                        return;
+                    }
+                }
+            } catch (e) {
+                console.error('Poll error:', e);
+            }
+            
+            if (attempts < maxAttempts) {
+                setTimeout(pollStatus, pollInterval);
+            } else {
+                showToast('GeoIP repair timed out — check Status page for progress', 'warning');
+                if (statusEl) {
+                    statusEl.innerHTML = '<span class="text-xs text-gray-500">Check Status page</span>';
+                }
+            }
+        };
+
+        setTimeout(pollStatus, pollInterval);
+
+    } catch (error) {
+        console.error('Failed to repair GeoIP databases:', error);
+        showToast('Failed to repair GeoIP databases: ' + error.message, 'error');
+        if (statusEl) {
+            statusEl.innerHTML = renderGeoIPDbStatus({ db_valid: false });
+        }
+    }
+}
+
 function renderMaxMindStatus(status) {
-    if (!status || !status.configured) {
+    // null/undefined = not checked yet (user must click 'Validate License')
+    if (status === null || status === undefined) {
+        return `
+            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400">
+                <svg class="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                Not checked
+            </span>
+        `;
+    }
+
+    if (!status.configured) {
         return `
             <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400">
                 Not configured
@@ -8745,11 +8954,17 @@ function renderGeoIPDbStatus(geoipConfig) {
         `;
     } else if (dbValid === false) {
         return `
-            <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
-                <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
-                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path>
-                </svg>
-                DB Corrupt
+            <span id="geoip-db-status" class="inline-flex items-center gap-1">
+                <span class="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400">
+                    <svg class="w-3 h-3 mr-1" fill="currentColor" viewBox="0 0 20 20">
+                        <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"></path>
+                    </svg>
+                    DB Corrupt
+                </span>
+                <button type="button" onclick="repairGeoIPDatabase()" class="px-2 py-1 bg-amber-500 hover:bg-amber-600 text-white rounded text-xs font-medium transition-colors duration-200 flex items-center gap-1">
+                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                    Repair
+                </button>
             </span>
         `;
     } else {

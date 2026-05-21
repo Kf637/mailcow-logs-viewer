@@ -110,3 +110,53 @@ def delete_all_config_overrides_from_db(db: Session) -> None:
     """Remove all config.* keys from system_settings (e.g. to reset to ENV-only)."""
     db.query(SystemSetting).filter(SystemSetting.key.startswith(CONFIG_PREFIX)).delete(synchronize_session=False)
     db.commit()
+
+
+# ── MaxMind license validation status persistence ─────────────────────────
+
+_MAXMIND_PREFIX = "maxmind."
+
+def get_maxmind_validation_status(db: Session) -> dict:
+    """Read the last MaxMind license validation result from DB.
+    Returns None if never checked, or a dict with configured/valid/error/checked_at."""
+    rows = db.query(SystemSetting).filter(SystemSetting.key.startswith(_MAXMIND_PREFIX)).all()
+    if not rows:
+        return None
+    data = {row.key[len(_MAXMIND_PREFIX):]: row.value for row in rows}
+    # Parse boolean strings
+    configured = data.get("license_configured", "false").lower() == "true"
+    valid = data.get("license_valid", "false").lower() == "true"
+    error = data.get("license_error", "") or None
+    checked_at = data.get("license_checked_at", "")
+    return {
+        "configured": configured,
+        "valid": valid,
+        "error": error,
+        "checked_at": checked_at or None
+    }
+
+
+def save_maxmind_validation_status(db: Session, result: dict) -> None:
+    """Persist a MaxMind license validation result to DB."""
+    from datetime import datetime, timezone
+    pairs = {
+        "license_configured": "true" if result.get("configured") else "false",
+        "license_valid": "true" if result.get("valid") else "false",
+        "license_error": result.get("error") or "",
+        "license_checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    for suffix, value in pairs.items():
+        key = _MAXMIND_PREFIX + suffix
+        row = db.query(SystemSetting).filter(SystemSetting.key == key).first()
+        if row:
+            row.value = value
+        else:
+            row = SystemSetting(key=key, value=value)
+            db.add(row)
+    db.commit()
+
+
+def clear_maxmind_validation_status(db: Session) -> None:
+    """Delete all maxmind.* keys from system_settings (e.g. after credentials change)."""
+    db.query(SystemSetting).filter(SystemSetting.key.startswith(_MAXMIND_PREFIX)).delete(synchronize_session=False)
+    db.commit()

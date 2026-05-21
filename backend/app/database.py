@@ -13,14 +13,20 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 # Create SQLAlchemy engine
-engine = create_engine(
-    settings.database_url,
-    poolclass=NullPool if settings.debug else None,
-    echo=settings.debug,
-    pool_pre_ping=True,  # Verify connections before using
-    pool_size=10,
-    max_overflow=20
-)
+engine_kwargs = {
+    "echo": settings.debug,
+    "pool_pre_ping": True,
+}
+
+if settings.debug:
+    # NullPool closes connections immediately after use (no pooling)
+    # It does NOT support pool_size / max_overflow parameters
+    engine_kwargs["poolclass"] = NullPool
+else:
+    engine_kwargs["pool_size"] = 10
+    engine_kwargs["max_overflow"] = 20
+
+engine = create_engine(settings.database_url, **engine_kwargs)
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
